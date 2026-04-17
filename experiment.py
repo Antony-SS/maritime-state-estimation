@@ -9,12 +9,14 @@ import sys
 from pathlib import Path
 import time
 import numpy as np
+import matplotlib.patches as mpatches
 
 import rps.robotarium as robotarium
 from rps.examples.state_estimation.extended_kalman_filter.uni_ekf import UnicycleEKF
 from rps.utilities.barrier_certificates import create_uni_barrier_certificate
 from rps.utilities.controllers import create_pose_controller_hybrid
 from rps.utilities.misc import create_at_pose
+from utilities import _xy_cov_ellipse_width_height_angle_deg
 
 # Allow `from map import Map` when running from this directory
 _ROOT = Path(__file__).resolve().parent
@@ -33,9 +35,10 @@ RECTANGLE_WAYPOINTS = [
 
 def run_experiment(
     cycles: int = 2,
-    process_noise: tuple[float, float, float] = (0.001, 0.001, 0.001),
+    process_noise: tuple[float, float, float] = (0.0001, 0.0001, 0.0001),
     range_gate_m: float = 0.5,
     range_meas_std_m: float = 0.025,
+    cov_n_sigma: float = 2.0,
 ) -> None:
     goal_points = np.array(RECTANGLE_WAYPOINTS * cycles).reshape(-1, 3)
     N = 1
@@ -83,6 +86,19 @@ def run_experiment(
     ax = r._axes_handle
     gt_trail, = ax.plot([], [], "b-", linewidth=1.5, label="Ground truth", zorder=4)
     kf_trail, = ax.plot([], [], "r--", linewidth=1.5, label="EKF (enc + range)", zorder=4)
+    cov_ellipse = mpatches.Ellipse(
+        (0.0, 0.0),
+        width=1e-6,
+        height=1e-6,
+        angle=0.0,
+        fill=False,
+        edgecolor="tab:purple",
+        linewidth=1.4,
+        linestyle=(0, (4, 3)),
+        zorder=6,
+        label=f"EKF P_xy ({cov_n_sigma:g}σ)",
+    )
+    ax.add_patch(cov_ellipse)
     ax.legend(loc="upper left", fontsize=9)
 
     gt_history: list[np.ndarray] = []
@@ -128,6 +144,15 @@ def run_experiment(
                 gt_trail.set_data(G[:, 0], G[:, 1])
                 kf_trail.set_data(K[:, 0], K[:, 1])
 
+            st = np.asarray(ekf.state, dtype=float).reshape(-1)
+            P_full = np.squeeze(np.asarray(ekf.P, dtype=float)).reshape(3, 3)
+            Pxy = P_full[:2, :2]
+            ew, eh, eang = _xy_cov_ellipse_width_height_angle_deg(Pxy, cov_n_sigma)
+            cov_ellipse.set_center((float(st[0]), float(st[1])))
+            cov_ellipse.set_width(ew)
+            cov_ellipse.set_height(eh)
+            cov_ellipse.set_angle(eang)
+
             r.set_velocities(np.arange(N), dxu)
             r.step()
 
@@ -137,9 +162,15 @@ def run_experiment(
 def parse_args():
     p = argparse.ArgumentParser(description="Maritime encoder EKF + beacon range updates")
     p.add_argument("--cycles", type=int, default=2)
-    p.add_argument("--process_noise", type=float, nargs=3, default=[0.005, 0.005, 0.005])
+    p.add_argument("--process_noise", type=float, nargs=3, default=[0.001, 0.001, 0.001])
     p.add_argument("--range_gate_m", type=float, default=0.85)
     p.add_argument("--range_meas_std_m", type=float, default=0.006)
+    p.add_argument(
+        "--cov_n_sigma",
+        type=float,
+        default=2.0,
+        help="Half-width of EKF (x,y) covariance ellipse in standard deviations (e.g. 2 for ~95%% contour).",
+    )
     return p.parse_args()
 
 
@@ -150,6 +181,7 @@ def main():
         process_noise=tuple(args.process_noise),
         range_gate_m=args.range_gate_m,
         range_meas_std_m=args.range_meas_std_m,
+        cov_n_sigma=args.cov_n_sigma,
     )
 
 
