@@ -12,9 +12,10 @@ import numpy as np
 import matplotlib.colors as mcolors
 import matplotlib.patches as patches
 import rps.robotarium as robotarium
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Sequence
 
 from gridmap import GridMap
+from utilities import AStarPathPlanner, _point_xy_at_arclength
 
 class Map:
     """
@@ -22,31 +23,32 @@ class Map:
     x is east (positive to the right)
     y is north (positive up)
     """
+
+    # GRIDMAP PARAMETERS
     BOUNDARIES: np.ndarray = np.array([-1.6, 1.6, -1.0, 1.0])
-    BUOY_DIST_FROM_CENTER_M = .5 # meters
-    NUMBER_OF_BUOYS = 3
     RESOLUTION: float = 0.01
 
-    # VISUALIZATION PARAMETERS
-
     # BUOY PARAMETERS
+    BUOY_DIST_FROM_CENTER_M = .5 # meters
+    NUMBER_OF_BUOYS = 3
     BUOY_RADIUS_M: float = 0.025
     BUOY_COLOR = "#ffcc33"
     BUOY_EDGE_COLOR = "#cc8800"
     BUOY_LINEWIDTH = 1.0
+    
+    # LAND MASS PARAMETERS
+    LAND_MASS_DATA_PATH: str = "./maritime-state-estimation/assets/map_a.npy"
+    LAND_MASS_COLOR: str = "#8be88b"
 
     # OCEAN PARAMETERS
     OCEAN_COLOR = "#5dade2"
     OCEAN_EDGE_COLOR = "none"
 
-    # LAND MASS PARAMETERS
-    LAND_MASS_DATA_PATH: str = "./maritime-state-estimation/assets/map_a.npy"
-    LAND_MASS_COLOR: str = "#8be88b"
+    # GRIDMAP COLOR KEY
+    GRIDMAP_COLOR_KEY: dict[int, str] = {
+        -1: LAND_MASS_COLOR,  # hard obstacle (matches :meth:`GridMap.visualize_gridmap` hard-obstacle red)
+    }
 
-    # Demo: random Gaussian blob of grid hits for visualization testing (set False to disable)
-    DEMO_BLOB_AT_XY: Tuple[float, float] = (0.5, 0.5)
-    DEMO_BLOB_N_POINTS: int = 450
-    DEMO_BLOB_STD_M: float = 0.035
 
     def __init__(self, r: robotarium.Robotarium, land_mass_data_path: str = LAND_MASS_DATA_PATH):
         self._r = r
@@ -56,34 +58,17 @@ class Map:
         self._overlap_im = None
         self.LAND_MASS_DATA_PATH = land_mass_data_path
         self.land_mass_data = np.load(self.LAND_MASS_DATA_PATH)
+
         if self._r.show_figure:
             self._draw_ocean_background()
-            self._draw_land_masses()
-            self.draw_overlap_cells()
-            self.draw_buoys()
+            self._add_land_mass_to_gridmap()
+            self._draw_gridmap(self.GRIDMAP_COLOR_KEY)
+            self._draw_buoys()
 
-    def add_random_xy_blob(
-        self,
-        center_xy: Tuple[float, float] = (0.5, 0.5),
-        n_points: int = 400,
-        std: float = 0.04,
-        rng: Optional[np.random.Generator] = None,
-    ) -> None:
-        """Scatter `n_points` in a 2D Gaussian around `center_xy`; increment grid cells (clipped to map)."""
-        rng = rng or np.random.default_rng()
-        cx, cy = center_xy
-        pts = rng.normal(loc=[cx, cy], scale=[std, std], size=(n_points, 2))
-        uv = self.gridmap.xy_to_uv(pts)
-        if uv.ndim == 1:
-            uv = uv.reshape(1, -1)
-        # xy_to_uv returns columns (u, v); grid rows index v, columns index u
-        u = uv[:, 0].astype(np.int64, copy=False)
-        v = uv[:, 1].astype(np.int64, copy=False)
-        h, w = self.gridmap.data.shape
-        mask = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-        u, v = u[mask], v[mask]
-        np.add.at(self.gridmap.data, (v, u), 1.0)
-    
+    def _add_land_mass_to_gridmap(self) -> None:
+        """Add the land mass to the gridmap."""
+        self.gridmap.data[self.land_mass_data > 0] = -1 # hard obstacle to avoid path planning through land masses
+
     def _generate_buoys(self) -> Dict[str, np.ndarray]:
         """Generate the buoys in the environment based on the number of buoys and the radius of the buoys. """
         buoys = {}
@@ -93,12 +78,6 @@ class Map:
             buoy_y = self.BUOY_DIST_FROM_CENTER_M * np.sin(buoy_angle)
             buoys[f"B{i+1}"] = np.array([buoy_x, buoy_y])
         return buoys
-
-    def uv_to_xy(self, uv: np.ndarray) -> np.ndarray:
-        return self.gridmap.uv_to_xy(uv)
-
-    def xy_to_uv(self, xy: np.ndarray) -> np.ndarray:
-        return self.gridmap.xy_to_uv(xy)
 
     def _draw_ocean_background(self) -> None:
         """Fill the arena with a blue rectangle behind everything else."""
@@ -116,21 +95,19 @@ class Map:
         )
         ax.add_patch(bg)
 
-    def _draw_land_masses(self) -> None:
-        """Draw the land mass in the environment based on the land mass data."""
+    def _draw_gridmap(self, color_key: dict[int, str]) -> None:
+        """Draw the gridmap with the color key. """
         if not self._r.show_figure:
             return
         ax = self._r._axes_handle
-        g = np.asarray(self.land_mass_data, dtype=np.float64)
+        g = self.gridmap.data
         h, w = g.shape
-        rgba = np.zeros((h, w, 4), dtype=np.float64)
+        rgba = np.zeros((h, w, 4), dtype=float)
         rgba[..., :] = (1.0, 1.0, 1.0, 0.0)
-        # Hex / name must become float RGBA for imshow (do not assign the string to rgba).
-        land_rgba = np.asarray(mcolors.to_rgba(self.LAND_MASS_COLOR), dtype=np.float64)
-        rgba[g > 0] = land_rgba
- 
+        for val, color in color_key.items():
+            rgba[g == val] = mcolors.to_rgba(color)
         extent = self.gridmap.extent_xy
-        self._land_mass_im = ax.imshow(
+        self._gridmap_im = ax.imshow(
             np.flipud(rgba),
             extent=extent,
             origin="lower",
@@ -163,7 +140,7 @@ class Map:
             zorder=0,
         )
 
-    def draw_buoys(self) -> None:
+    def _draw_buoys(self) -> None:
         """Draw buoys as small circles in world coordinates on the Robotarium axes."""
         if not self._r.show_figure:
             return
@@ -180,4 +157,313 @@ class Map:
             )
             ax.add_patch(c)
             self._buoy_patches.append(c)
+
+
+class Router:
+    """Build stitched world polylines by running :class:`AStarPathPlanner` between ordered waypoints."""
+
+    # Nominal routes can be offset into a lateral zigzag; A* stitches between offset samples.
+    DEFAULT_LAWN_HALF_WIDTH_M = 0.15  # lateral offset from nominal (± this, alternating)
+    DEFAULT_LAWN_STEP_M = 0.3  # resample nominal every this many metres along arc length (smaller = finer)
+
+    def __init__(self, map: Map):
+        self.map = map
+        self.astar_planner = AStarPathPlanner(self.map.gridmap)
+
+    @staticmethod
+    def _resample_polyline_arclength(xy: np.ndarray, step_m: float) -> np.ndarray:
+        """Polyline ``(L, 2)`` resampled at roughly uniform arc-length spacing ``step_m`` (includes ends)."""
+        xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+        if xy.shape[0] <= 1 or step_m <= 0.0:
+            return xy.copy()
+        seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+        total = float(np.sum(seg))
+        if total < 1e-9:
+            return xy[:1].copy()
+        step_m = max(float(step_m), 1e-4)
+        s_vals = [0.0]
+        s = step_m
+        while s < total - 1e-9:
+            s_vals.append(s)
+            s += step_m
+        if s_vals[-1] < total - 1e-6:
+            s_vals.append(total)
+        return np.stack([_point_xy_at_arclength(xy, float(s)) for s in s_vals], axis=0)
+
+    @staticmethod
+    def _normals_along_polyline(centers: np.ndarray) -> np.ndarray:
+        """Unit left normals (ENU) at each vertex, from chord directions."""
+        c = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+        m = c.shape[0]
+        nrm = np.zeros_like(c)
+        for i in range(m):
+            if i == 0 and m > 1:
+                d = c[1] - c[0]
+            elif i == m - 1 and m > 1:
+                d = c[-1] - c[-2]
+            else:
+                d = c[i + 1] - c[i - 1]
+            ln = float(np.linalg.norm(d))
+            if ln < 1e-12:
+                nrm[i] = np.array([0.0, 1.0], dtype=np.float64)
+            else:
+                t = d / ln
+                nrm[i] = np.array([-t[1], t[0]], dtype=np.float64)
+        return nrm
+
+    def _xy_inflated_navigable(self, xy: np.ndarray) -> bool:
+        """True iff the grid cell under ``xy`` is traversable in A* (``inflated_map[v, u] >= 0``)."""
+        p = np.asarray(xy, dtype=np.float64).reshape(2)
+        gm = self.astar_planner.gridmap
+        nav = self.astar_planner.inflated_map
+        uv = np.asarray(gm.xy_to_uv(p), dtype=np.int64).reshape(2)
+        u, v = int(uv[0]), int(uv[1])
+        if u < 0 or u >= gm.width or v < 0 or v >= gm.height:
+            return False
+        return float(nav[v, u]) >= 0.0
+
+    def _snap_xy_to_inflated_navigable(self, xy: np.ndarray, max_ring: int = 100) -> np.ndarray:
+        """
+        If ``xy`` lies in a blocked **inflated** cell, return the centre of the closest cell with
+        ``inflated_map >= 0`` (Chebyshev search up to ``max_ring`` cells). Otherwise return ``xy``.
+        """
+        p = np.asarray(xy, dtype=np.float64).reshape(2)
+        if self._xy_inflated_navigable(p):
+            return p.copy()
+        gm = self.astar_planner.gridmap
+        nav = self.astar_planner.inflated_map
+        uv0 = np.asarray(gm.xy_to_uv(p), dtype=np.int64).reshape(2)
+        u0, v0 = int(uv0[0]), int(uv0[1])
+        best: tuple[int, int, int] | None = None  # (dist2, u, v)
+        for du in range(-max_ring, max_ring + 1):
+            for dv in range(-max_ring, max_ring + 1):
+                u, v = u0 + du, v0 + dv
+                if u < 0 or u >= gm.width or v < 0 or v >= gm.height:
+                    continue
+                if float(nav[v, u]) < 0.0:
+                    continue
+                d2 = du * du + dv * dv
+                if best is None or d2 < best[0]:
+                    best = (d2, u, v)
+        if best is None:
+            return p.copy()
+        return np.asarray(
+            gm.uv_to_xy(np.array([float(best[1]), float(best[2])], dtype=np.float64)),
+            dtype=np.float64,
+        ).reshape(2)
+
+    def _lawn_keypoints_from_nominal(
+        self,
+        nominal_xy: np.ndarray,
+        lawn_half_width_m: float,
+        lawn_step_m: float,
+    ) -> np.ndarray:
+        """
+        Resample nominal, then push interior samples ± ``lawn_half_width_m`` along left normal
+        (alternating). Endpoints stay on the nominal polyline. A lateral sample that falls in an
+        **inflated** blocked cell (same mask as A*) is replaced by the on-nominal center so A* can
+        still connect segments.
+        """
+        nominal_xy = np.asarray(nominal_xy, dtype=np.float64).reshape(-1, 2)
+        if nominal_xy.shape[0] <= 1 or lawn_half_width_m <= 0.0 or lawn_step_m <= 0.0:
+            return nominal_xy.copy()
+        centers = self._resample_polyline_arclength(nominal_xy, lawn_step_m)
+        m = centers.shape[0]
+        if m <= 2:
+            return centers.copy()
+        normals = self._normals_along_polyline(centers)
+        out = centers.copy()
+        for i in range(1, m - 1):
+            side = 1.0 if (i % 2 == 0) else -1.0
+            cand = centers[i] + side * lawn_half_width_m * normals[i]
+            out[i] = cand if self._xy_inflated_navigable(cand) else centers[i]
+        return out
+
+    def _apply_lawn_around_nominal(
+        self,
+        nominal_xy: np.ndarray,
+        lawn_half_width_m: float,
+        lawn_step_m: float,
+        *,
+        heuristic_weight: float = 1.0,
+    ) -> np.ndarray:
+        """Stitched A* through lateral zigzag keypoints; single-point routes unchanged."""
+        nominal_xy = np.asarray(nominal_xy, dtype=np.float64).reshape(-1, 2)
+        if nominal_xy.shape[0] <= 1:
+            return nominal_xy.copy()
+        if lawn_half_width_m <= 0.0 or lawn_step_m <= 0.0:
+            return nominal_xy.copy()
+        keys = self._lawn_keypoints_from_nominal(nominal_xy, lawn_half_width_m, lawn_step_m)
+        return self.chain_astar(keys, heuristic_weight=heuristic_weight)
+
+    def generate_scouting_phase_routes(
+        self,
+        initial_conditions: np.ndarray,
+        *,
+        lawn_half_width_m: float | None = None,
+        lawn_step_m: float | None = None,
+    ) -> List[np.ndarray]:
+        """
+        ``initial_conditions`` matches Robotarium: shape ``(3, N)`` with rows ``[x; y; θ]`` and
+        column ``i`` = robot ``i`` (same as ``START_POINTS.T`` in ``experiment``).
+
+        After nominal A* routes are built, each multi-point route is replaced by a **lateral lawn**
+        (zigzag about the nominal), then A*-stitched again so motion respects obstacles.
+
+        Tunables (``None`` → class defaults):
+
+        - ``lawn_half_width_m``: lateral offset magnitude; path alternates ``+/-`` this each sample.
+        - ``lawn_step_m``: arc-length spacing along nominal between samples (smaller = finer / more A* segments).
+        """
+        half_w = (
+            float(lawn_half_width_m)
+            if lawn_half_width_m is not None
+            else float(self.DEFAULT_LAWN_HALF_WIDTH_M)
+        )
+        step = (
+            float(lawn_step_m) if lawn_step_m is not None else float(self.DEFAULT_LAWN_STEP_M)
+        )
+        ic = np.asarray(initial_conditions, dtype=np.float64)
+        if ic.ndim != 2 or ic.shape[0] < 2:
+            raise ValueError("initial_conditions must be 2D with at least 2 rows (x, y, …).")
+        n = ic.shape[1]
+        xy = lambda i: ic[:2, i].reshape(2)
+
+        routes: List[np.ndarray] = [xy(0).reshape(1, 2)]
+        if n <= 1:
+            return routes
+
+        end_goal = np.array([1.5, -0.35], dtype=np.float64)
+
+        end_goal_s1 = np.array([1.4, -0.65], dtype=np.float64)
+
+        ordered_s1 = np.vstack(
+            (
+                xy(1).reshape(1, 2),
+                np.array(
+                    [[-1.2, -0.7], [-0.7, -0.45], [-0.25, -0.7], [0.00, -0.45], [1.0, -0.7], end_goal_s1],
+                    dtype=np.float64,
+                ),
+            )
+        )
+
+        end_goal_s2 = np.array([1.5, -0.35], dtype=np.float64)
+
+        ordered_s2 = np.vstack(
+            (
+                xy(2).reshape(1, 2),
+                np.array(
+                    [[-0.75, -.2], [-0.35, 0.175], [0.15, -0.3], [0.4, -0.2], [0.8, -0.75], end_goal_s2],
+                    dtype=np.float64,
+                ),
+            )
+        )
+
+        end_goal_s3 = np.array([1.4, -0.00], dtype=np.float64)
+
+        ordered_s3 = np.vstack(
+            (
+                xy(3).reshape(1, 2),
+                np.array(
+                    [[-0.6, 0.6], [0.5, 0.25], [1.1, 0.1], end_goal_s3],
+                    dtype=np.float64,
+                ),
+            )
+        )
+
+        routes.append(self.chain_astar(ordered_s1, heuristic_weight=1.0))
+        routes.append(self.chain_astar(ordered_s2, heuristic_weight=1.0))
+        routes.append(self.chain_astar(ordered_s3, heuristic_weight=1.0))
+
+        return [
+            self._apply_lawn_around_nominal(r, half_w, step, heuristic_weight=1.0) for r in routes
+        ]
+
+    @staticmethod
+    def _dedupe_consecutive_xy(keys: np.ndarray, atol: float = 1e-7) -> np.ndarray:
+        keys = np.asarray(keys, dtype=np.float64).reshape(-1, 2)
+        if keys.shape[0] <= 1:
+            return keys.copy()
+        out = [keys[0]]
+        for i in range(1, keys.shape[0]):
+            if not np.allclose(keys[i], out[-1], atol=atol, rtol=0.0):
+                out.append(keys[i])
+        return np.stack(out, axis=0)
+
+    def chain_astar(
+        self,
+        ordered_xy: np.ndarray,
+        *,
+        heuristic_weight: float = 1.0,
+    ) -> np.ndarray:
+        """
+        ``ordered_xy`` is ``(K, 2)`` world points in visit order. Runs A* from row ``j`` to ``j+1``
+        for each segment and concatenates (dropping duplicate junction vertices).
+        """
+        chain = self._dedupe_consecutive_xy(ordered_xy)
+        k = chain.shape[0]
+        if k <= 1:
+            return chain.copy()
+        chunks: List[np.ndarray] = []
+        for j in range(k - 1):
+            a_raw = chain[j].reshape(2)
+            b_raw = chain[j + 1].reshape(2)
+            a = self._snap_xy_to_inflated_navigable(a_raw)
+            b = self._snap_xy_to_inflated_navigable(b_raw)
+            seg = self.astar_planner.plan(a, b, heuristic_weight=heuristic_weight)
+            if seg.size == 0:
+                raise RuntimeError(
+                    f"A* failed on segment {j}→{j + 1}: "
+                    f"({a_raw[0]:.4f}, {a_raw[1]:.4f}) → ({b_raw[0]:.4f}, {b_raw[1]:.4f}) "
+                    f"(snapped to inflated-free cell centres: "
+                    f"({a[0]:.4f}, {a[1]:.4f}) → ({b[0]:.4f}, {b[1]:.4f}))."
+                )
+            chunks.append(np.asarray(seg, dtype=np.float64).reshape(-1, 2))
+        out = chunks[0]
+        for seg in chunks[1:]:
+            if out.size and seg.size and np.allclose(out[-1], seg[0], atol=1e-8, rtol=0.0):
+                out = np.vstack((out, seg[1:]))
+            else:
+                out = np.vstack((out, seg))
+        return out
+
+    def routes_through_waypoints(
+        self,
+        starts_xy: np.ndarray,
+        waypoints_per_robot: Sequence[np.ndarray],
+        *,
+        heuristic_weight: float = 1.0,
+    ) -> List[np.ndarray]:
+        """
+        For each robot ``i``, build one polyline: **start** = ``starts_xy[:, i]``, then visit that
+        robot's rows in ``waypoints_per_robot[i]`` in order. Each consecutive pair is connected with
+        A* and segments are concatenated.
+
+        Parameters
+        ----------
+        starts_xy
+            Shape ``(2, N)`` world ENU (m), column ``i`` = robot ``i`` start (e.g. poses from initial conditions).
+        waypoints_per_robot
+            Length ``N``. Element ``i`` is shape ``(K_i, 2)`` with **additional** goals (not repeating
+            the start). Use ``(0, 2)`` if the robot should only hold at its start (e.g. mothership).
+        """
+        s = np.asarray(starts_xy, dtype=np.float64).reshape(2, -1)
+        n = s.shape[1]
+        if len(waypoints_per_robot) != n:
+            raise ValueError(
+                f"waypoints_per_robot has length {len(waypoints_per_robot)}, expected N={n}."
+            )
+        routes: List[np.ndarray] = []
+        for i in range(n):
+            start = s[:, i].reshape(1, 2)
+            wps = np.asarray(waypoints_per_robot[i], dtype=np.float64).reshape(-1, 2)
+            if wps.size == 0:
+                routes.append(start.copy())
+                continue
+            ordered = np.vstack((start, wps))
+            try:
+                routes.append(self.chain_astar(ordered, heuristic_weight=heuristic_weight))
+            except RuntimeError as e:
+                raise RuntimeError(f"robot {i}: {e}") from e
+        return routes
 

@@ -245,24 +245,59 @@ class GridMap:
                 **{k: v for k, v in extra.items() if k not in {"extent", "origin", "interpolation"}},
             )
         else:
-            lo = float(np.min(d)) if vmin is None else float(vmin)
-            hi = float(np.max(d)) if vmax is None else float(vmax)
-            if hi <= lo:
-                scaled = np.zeros_like(d, dtype=np.uint8)
+            obs = d == -1
+            if np.any(obs):
+                d_vis = np.where(obs, np.nan, d.astype(np.float64))
+                lo = (
+                    float(np.nanmin(d_vis))
+                    if vmin is None
+                    else float(vmin)
+                )
+                hi = (
+                    float(np.nanmax(d_vis))
+                    if vmax is None
+                    else float(vmax)
+                )
+                if (
+                    hi <= lo
+                    or not np.isfinite(lo)
+                    or not np.isfinite(hi)
+                    or np.all(obs)
+                ):
+                    scaled = np.zeros_like(d, dtype=np.float64)
+                else:
+                    scaled = np.clip((d.astype(np.float64) - lo) / (hi - lo) * 255.0, 0.0, 255.0)
+                scaled = np.where(obs, np.nan, scaled)
+                gray_rgb = np.stack([scaled] * 3, axis=-1) / 255.0
+                gray_rgb = np.nan_to_num(gray_rgb, nan=0.0)
+                rgba = np.concatenate([gray_rgb, np.ones((*d.shape, 1), dtype=np.float64)], axis=-1)
+                rgba[obs] = to_rgba("#c0392b")
+                im = ax.imshow(
+                    np.flipud(rgba),
+                    extent=extent,
+                    origin="lower",
+                    interpolation=interpolation,
+                    **{k: v for k, v in extra.items() if k not in {"extent", "origin", "interpolation"}},
+                )
             else:
-                scaled = np.clip((d - lo) / (hi - lo) * 255.0, 0.0, 255.0).astype(np.uint8)
-            z = np.flipud(scaled.astype(np.float32))
-            pm_extras = {k: v for k, v in extra.items() if k not in {"cmap", "vmin", "vmax", "interpolation"}}
-            im = ax.pcolormesh(
-                xe,
-                ye,
-                z,
-                cmap="gray",
-                vmin=0,
-                vmax=255,
-                shading="flat",
-                **pm_extras,
-            )
+                lo = float(np.min(d)) if vmin is None else float(vmin)
+                hi = float(np.max(d)) if vmax is None else float(vmax)
+                if hi <= lo:
+                    scaled = np.zeros_like(d, dtype=np.uint8)
+                else:
+                    scaled = np.clip((d - lo) / (hi - lo) * 255.0, 0.0, 255.0).astype(np.uint8)
+                z = np.flipud(scaled.astype(np.float32))
+                pm_extras = {k: v for k, v in extra.items() if k not in {"cmap", "vmin", "vmax", "interpolation"}}
+                im = ax.pcolormesh(
+                    xe,
+                    ye,
+                    z,
+                    cmap="gray",
+                    vmin=0,
+                    vmax=255,
+                    shading="flat",
+                    **pm_extras,
+                )
 
         ax.set_xlim(float(b[0]), float(b[1]))
         ax.set_ylim(float(b[2]), float(b[3]))
