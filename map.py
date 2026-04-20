@@ -68,7 +68,7 @@ class Map:
 
     
     # LAND MASS PARAMETERS
-    LAND_MASS_DATA_PATH: str = "./maritime-state-estimation/assets/map_a.npy"
+    LAND_MASS_DATA_PATH: str = "./map_a.npy"
     LAND_MASS_COLOR: str = "#8be88b"
 
     # OCEAN PARAMETERS
