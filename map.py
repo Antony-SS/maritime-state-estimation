@@ -2,7 +2,7 @@
 This file contains the code to generate the map of the maritime environment, including:
 
 - islands/buoys
-- lighthouses (tbd)
+- lighthouses
 - gps denied areas
 - adversarial things to map
 
@@ -29,12 +29,43 @@ class Map:
     RESOLUTION: float = 0.01
 
     # BUOY PARAMETERS
-    BUOY_DIST_FROM_CENTER_M = .5 # meters
-    NUMBER_OF_BUOYS = 3
-    BUOY_RADIUS_M: float = 0.025
+    BUOY_COORDINATES: list[tuple[float, float]] = [(-1.0, 0.1), (0.0, -0.45), (0.1, 0.0), (0.9, 0.25), (0.9, -.55), (0.5, -.75)]
+    BUOY_RADIUS_M: float = 0.01
     BUOY_COLOR = "#ffcc33"
-    BUOY_EDGE_COLOR = "#cc8800"
-    BUOY_LINEWIDTH = 1.0
+    BUOY_EDGE_COLOR = "none"
+
+    # LIGHTHOUSES
+    LIGHTHOUSE_COORDINATES: list[tuple[float, float]] = [(-0.375, -0.2), (0.5, 0.55)]
+    LIGHTHOUSE_RADIUS_M = 0.04
+    LIGHTHOUSE_COLOR = "#ffffff"
+    # Simulated bearing/range noise variances (rad², m²); also used as EKF measurement covariance R.
+    LIGHTHOUSE_BEARING_MEAS_VAR_RAD2: float = 0.04**2
+    LIGHTHOUSE_RANGE_MEAS_VAR_M2: float = 0.08**2
+    # Tiered sighting (m): ``d`` = ground range to beacon; ``d_min`` = ``LIGHTHOUSE_MEASUREMENT_MIN_RANGE_M``.
+    # Bearing is usable farther out than range. ``d_min < d < BEARING_AND_RANGE_MAX`` → bearing + range;
+    # ``BEARING_AND_RANGE_MAX <= d < BEARING_SIGHTING_MAX`` → bearing only; otherwise no measurement.
+    # Require ``BEARING_AND_RANGE_MAX_M <= BEARING_SIGHTING_MAX_M``.
+    LIGHTHOUSE_MEASUREMENT_MIN_RANGE_M: float = 0.08
+    LIGHTHOUSE_BEARING_AND_RANGE_MAX_M: float = 0.6
+    LIGHTHOUSE_BEARING_SIGHTING_MAX_M: float = 0.75
+
+    # Robot spawn poses (ENU m, heading rad): one row per robot; row 0 = mothership. Shape (N, 3);
+    # transpose to (3, N) for Robotarium ``initial_conditions``.
+    START_POINTS: np.ndarray = np.array(
+        [
+            [-1.5, 0.90, 0.0],  # Mothership
+            [-1.5, 0.30, 0.0],  # Scout 1
+            [-.95, 0.325, 0.0],  # Scout 2
+            [-1.2, 0.70, 0.0],  # Scout 3
+        ],
+        dtype=np.float64,
+    )
+
+    # ENEMY SHIPS/BASES (ASSUMED TO BE STATIC)
+    ENEMY_COORDINATES: list[tuple[float, float]] = [(-1.3, -.7), (-0.1, 0.6), (0.0, 0.0), (0.6, -0.7), (0.1, 0.3)]
+    ENEMY_RADIUS_M: float = 0.02
+    ENEMY_COLOR = "#c0392b"  # red
+
     
     # LAND MASS PARAMETERS
     LAND_MASS_DATA_PATH: str = "./maritime-state-estimation/assets/map_a.npy"
@@ -46,7 +77,7 @@ class Map:
 
     # GRIDMAP COLOR KEY
     GRIDMAP_COLOR_KEY: dict[int, str] = {
-        -1: LAND_MASS_COLOR,  # hard obstacle (matches :meth:`GridMap.visualize_gridmap` hard-obstacle red)
+        -1: LAND_MASS_COLOR, # hard obstacle (land mass)
     }
 
 
@@ -54,7 +85,10 @@ class Map:
         self._r = r
         self.gridmap = GridMap.empty(self.BOUNDARIES, self.RESOLUTION)
         self.buoys = self._generate_buoys()
+        self.lighthouses = self._generate_lighthouses()
         self._buoy_patches: List[patches.Circle] = []
+        self._lighthouse_patches: List[patches.Circle] = []
+        self._enemy_patches: List[patches.RegularPolygon] = []
         self._overlap_im = None
         self.LAND_MASS_DATA_PATH = land_mass_data_path
         self.land_mass_data = np.load(self.LAND_MASS_DATA_PATH)
@@ -64,20 +98,26 @@ class Map:
             self._add_land_mass_to_gridmap()
             self._draw_gridmap(self.GRIDMAP_COLOR_KEY)
             self._draw_buoys()
+            self._draw_lighthouses()
+            self._draw_enemies()
 
     def _add_land_mass_to_gridmap(self) -> None:
         """Add the land mass to the gridmap."""
         self.gridmap.data[self.land_mass_data > 0] = -1 # hard obstacle to avoid path planning through land masses
 
     def _generate_buoys(self) -> Dict[str, np.ndarray]:
-        """Generate the buoys in the environment based on the number of buoys and the radius of the buoys. """
-        buoys = {}
-        for i in range(self.NUMBER_OF_BUOYS):
-            buoy_angle = 2 * np.pi * i / self.NUMBER_OF_BUOYS
-            buoy_x = self.BUOY_DIST_FROM_CENTER_M * np.cos(buoy_angle)
-            buoy_y = self.BUOY_DIST_FROM_CENTER_M * np.sin(buoy_angle)
-            buoys[f"B{i+1}"] = np.array([buoy_x, buoy_y])
-        return buoys
+        """Place buoys at ``BUOY_COORDINATES`` (ENU, metres); keys ``B1``, ``B2``, … in list order."""
+        return {
+            f"B{i + 1}": np.asarray(xy, dtype=np.float64).reshape(2)
+            for i, xy in enumerate(self.BUOY_COORDINATES)
+        }
+
+    def _generate_lighthouses(self) -> Dict[str, np.ndarray]:
+        """Known beacon positions at ``LIGHTHOUSE_COORDINATES``; keys ``L1``, ``L2``, … in list order."""
+        return {
+            f"L{i + 1}": np.asarray(xy, dtype=np.float64).reshape(2)
+            for i, xy in enumerate(self.LIGHTHOUSE_COORDINATES)
+        }
 
     def _draw_ocean_background(self) -> None:
         """Fill the arena with a blue rectangle behind everything else."""
@@ -152,11 +192,50 @@ class Map:
                 radius=self.BUOY_RADIUS_M,
                 facecolor=self.BUOY_COLOR,
                 edgecolor=self.BUOY_EDGE_COLOR,
-                linewidth=1.0,
+                linewidth=0.0,
                 zorder=1,
             )
             ax.add_patch(c)
             self._buoy_patches.append(c)
+
+    def _draw_lighthouses(self) -> None:
+        """Draw lighthouses as white circles in world coordinates."""
+        if not self._r.show_figure:
+            return
+        ax = self._r._axes_handle
+        for xy in self.LIGHTHOUSE_COORDINATES:
+            p = np.asarray(xy, dtype=float).reshape(2)
+            c = patches.Circle(
+                (float(p[0]), float(p[1])),
+                radius=float(self.LIGHTHOUSE_RADIUS_M),
+                facecolor=self.LIGHTHOUSE_COLOR,
+                edgecolor="none",
+                linewidth=0.0,
+                zorder=1,
+            )
+            ax.add_patch(c)
+            self._lighthouse_patches.append(c)
+
+    def _draw_enemies(self) -> None:
+        """Draw static enemy bases/ships as red triangles at ``ENEMY_COORDINATES`` (apex toward +y)."""
+        if not self._r.show_figure:
+            return
+        ax = self._r._axes_handle
+        r = float(self.ENEMY_RADIUS_M)
+        for xy in self.ENEMY_COORDINATES:
+            p = np.asarray(xy, dtype=float).reshape(2)
+            tri = patches.RegularPolygon(
+                (float(p[0]), float(p[1])),
+                numVertices=3,
+                radius=r,
+                orientation=np.pi / 2.0,
+                facecolor=self.ENEMY_COLOR,
+                edgecolor="none",
+                linewidth=0.0,
+                zorder=1,
+            )
+            ax.add_patch(tri)
+            self._enemy_patches.append(tri)
 
 
 class Router:
@@ -305,7 +384,7 @@ class Router:
     ) -> List[np.ndarray]:
         """
         ``initial_conditions`` matches Robotarium: shape ``(3, N)`` with rows ``[x; y; θ]`` and
-        column ``i`` = robot ``i`` (same as ``START_POINTS.T`` in ``experiment``).
+        column ``i`` = robot ``i`` (same as ``Map.START_POINTS.T``).
 
         After nominal A* routes are built, each multi-point route is replaced by a **lateral lawn**
         (zigzag about the nominal), then A*-stitched again so motion respects obstacles.
@@ -378,6 +457,36 @@ class Router:
         return [
             self._apply_lawn_around_nominal(r, half_w, step, heuristic_weight=1.0) for r in routes
         ]
+
+    def generate_return_to_home_routes(
+        self,
+        current_xy: np.ndarray,
+        initial_conditions: np.ndarray,
+        *,
+        heuristic_weight: float = 1.0,
+    ) -> List[np.ndarray]:
+        """
+        **Return-to-home phase:** for each robot, a single A* polyline from its current ``(x, y)``
+        to that robot's spawn ``(x, y)`` from ``initial_conditions`` (rows ``[x; y; θ]``, column ``i``).
+
+        No intermediate waypoints and no lawnmower — only ``start → home`` per robot.
+        """
+        cur = np.asarray(current_xy, dtype=np.float64).reshape(2, -1)
+        ic = np.asarray(initial_conditions, dtype=np.float64)
+        if ic.ndim != 2 or ic.shape[0] < 2:
+            raise ValueError("initial_conditions must be 2D with at least rows x, y.")
+        n = ic.shape[1]
+        if cur.shape[1] != n:
+            raise ValueError(
+                f"current_xy has {cur.shape[1]} columns, initial_conditions has N={n}."
+            )
+        routes: List[np.ndarray] = []
+        for i in range(n):
+            start = cur[:, i].reshape(1, 2)
+            home = ic[:2, i].reshape(1, 2)
+            ordered = np.vstack((start, home))
+            routes.append(self.chain_astar(ordered, heuristic_weight=heuristic_weight))
+        return routes
 
     @staticmethod
     def _dedupe_consecutive_xy(keys: np.ndarray, atol: float = 1e-7) -> np.ndarray:
