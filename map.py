@@ -1,7 +1,7 @@
 """
 This file contains the code to generate the map of the maritime environment, including:
 
-- islands/buoys
+- islands; static enemy ships (former buoy sites are included in ``ENEMY_COORDINATES``)
 - lighthouses
 - gps denied areas
 - adversarial things to map
@@ -15,7 +15,9 @@ import rps.robotarium as robotarium
 from typing import List, Dict, Optional, Sequence
 
 from gridmap import GridMap
-from utilities import AStarPathPlanner, _point_xy_at_arclength
+from rps.robotarium_abc import ARobotarium
+
+from utilities import AStarPathPlanner, _point_xy_at_arclength, fused_enemy_belief_cost_field
 
 class Map:
     """
@@ -28,8 +30,8 @@ class Map:
     BOUNDARIES: np.ndarray = np.array([-1.6, 1.6, -1.0, 1.0])
     RESOLUTION: float = 0.01
 
-    # BUOY PARAMETERS
-    BUOY_COORDINATES: list[tuple[float, float]] = [(-1.0, 0.1), (0.0, -0.45), (0.1, 0.0), (0.9, 0.25), (0.9, -.55), (0.5, -.75)]
+    # Buoys removed from the scenario; ``BUOY_COORDINATES`` is empty (``self.buoys`` stays a dict for API).
+    BUOY_COORDINATES: list[tuple[float, float]] = []
     BUOY_RADIUS_M: float = 0.01
     BUOY_COLOR = "#ffcc33"
     BUOY_EDGE_COLOR = "none"
@@ -61,18 +63,34 @@ class Map:
         dtype=np.float64,
     )
 
-    # ENEMY SHIPS/BASES (ASSUMED TO BE STATIC)
-    ENEMY_COORDINATES: list[tuple[float, float]] = [(-1.3, -.7), (-0.1, 0.6), (0.0, 0.0), (0.6, -0.7), (0.1, 0.3)]
+    # ENEMY SHIPS/BASES (ASSUMED TO BE STATIC): original enemies plus former buoy positions.
+    ENEMY_COORDINATES: list[tuple[float, float]] = [
+        (-1.3, -0.7),
+        (-0.1, 0.6),
+        (0.0, 0.0),
+        (0.6, -0.7),
+        (0.1, 0.3),
+        (-1.0, 0.1),
+        (0.0, -0.325),
+        (0.9, 0.25),
+        (0.9, -0.55),
+    ]
     ENEMY_RADIUS_M: float = 0.02
     ENEMY_COLOR = "#c0392b"  # red
 
+    # Enemy hazard stamp: ``σ_r = NAV_ENEMY_INFLATION_RADIUS_MULT × (COLLISION_DIAMETER / 2)`` in
+    # ``P + σ_r² I`` (see :meth:`apply_fused_enemy_costs_for_nav_planning`). Larger ``σ_r`` vs the
+    # belief's eigenvalues makes the 2σ footprint look rounder in world space even when ``P`` is
+    # elongated (isotropic inflation dominates anisotropy).
+    NAV_ENEMY_INFLATION_RADIUS_MULT: float = 1.75
     
     # LAND MASS PARAMETERS
     LAND_MASS_DATA_PATH: str = "./map_a.npy"
-    LAND_MASS_COLOR: str = "#8be88b"
+    # Brighter than default for Robotarium projectors (readability in a lit room).
+    LAND_MASS_COLOR: str = "#c5fbc8"
 
     # OCEAN PARAMETERS
-    OCEAN_COLOR = "#5dade2"
+    OCEAN_COLOR = "#9ee9ff"
     OCEAN_EDGE_COLOR = "none"
 
     # GRIDMAP COLOR KEY
@@ -80,6 +98,17 @@ class Map:
         -1: LAND_MASS_COLOR, # hard obstacle (land mass)
     }
 
+    # Matplotlib z-order: Robotarium robot patches are redrawn at ``zorder=2`` each step, so every
+    # decoration added here must stay **strictly below 2** or robots disappear under the map.
+    VIZ_Z_ENEMY_COST_HEAT = 0.12
+    VIZ_Z_MAINLAND_LABEL = 0.28
+    VIZ_Z_ENV_ICON = 0.48  # lighthouses, enemy ship markers
+    # ``experiment.py`` overlays (same <2 rule; keep ordering sensible: trails → LM → pose → fused).
+    VIZ_Z_GT_KF_TRAIL = 0.92
+    VIZ_Z_LM_COV = 1.05
+    VIZ_Z_POSE_COV = 1.15
+    VIZ_Z_FUSED_LM = 1.32
+    VIZ_Z_DEATH_MARKER = 1.70
 
     def __init__(self, r: robotarium.Robotarium, land_mass_data_path: str = LAND_MASS_DATA_PATH):
         self._r = r
@@ -90,6 +119,9 @@ class Map:
         self._lighthouse_patches: List[patches.Circle] = []
         self._enemy_patches: List[patches.RegularPolygon] = []
         self._overlap_im = None
+        self._enemy_inflated_risk_im = None
+        self._enemy_stamped_positive: np.ndarray | None = None
+        self._nav_cost_inflation_radius_m: float | None = None
         self.LAND_MASS_DATA_PATH = land_mass_data_path
         self.land_mass_data = np.load(self.LAND_MASS_DATA_PATH)
 
@@ -97,9 +129,11 @@ class Map:
             self._draw_ocean_background()
             self._add_land_mass_to_gridmap()
             self._draw_gridmap(self.GRIDMAP_COLOR_KEY)
-            self._draw_buoys()
+            if self.buoys:
+                self._draw_buoys()
             self._draw_lighthouses()
             self._draw_enemies()
+            self._draw_mainland_label()
 
     def _add_land_mass_to_gridmap(self) -> None:
         """Add the land mass to the gridmap."""
@@ -193,7 +227,7 @@ class Map:
                 facecolor=self.BUOY_COLOR,
                 edgecolor=self.BUOY_EDGE_COLOR,
                 linewidth=0.0,
-                zorder=1,
+                zorder=float(self.VIZ_Z_ENV_ICON),
             )
             ax.add_patch(c)
             self._buoy_patches.append(c)
@@ -203,18 +237,37 @@ class Map:
         if not self._r.show_figure:
             return
         ax = self._r._axes_handle
-        for xy in self.LIGHTHOUSE_COORDINATES:
-            p = np.asarray(xy, dtype=float).reshape(2)
+        r_lh = float(self.LIGHTHOUSE_RADIUS_M)
+        for _, pos in self.lighthouses.items():
+            p = np.asarray(pos, dtype=float).reshape(2)
             c = patches.Circle(
                 (float(p[0]), float(p[1])),
-                radius=float(self.LIGHTHOUSE_RADIUS_M),
+                radius=r_lh,
                 facecolor=self.LIGHTHOUSE_COLOR,
                 edgecolor="none",
                 linewidth=0.0,
-                zorder=1,
+                zorder=float(self.VIZ_Z_ENV_ICON),
             )
             ax.add_patch(c)
             self._lighthouse_patches.append(c)
+
+    def _draw_mainland_label(self) -> None:
+        """Annotate the land region for viewers (axes upper-right, over the landmass)."""
+        if not self._r.show_figure:
+            return
+        ax = self._r._axes_handle
+        ax.text(
+            0.82,
+            0.78,
+            "Mainland",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=15,
+            fontweight="semibold",
+            color="#0d3d0d",
+            zorder=float(self.VIZ_Z_MAINLAND_LABEL),
+        )
 
     def _draw_enemies(self) -> None:
         """Draw static enemy bases/ships as red triangles at ``ENEMY_COORDINATES`` (apex toward +y)."""
@@ -232,10 +285,110 @@ class Map:
                 facecolor=self.ENEMY_COLOR,
                 edgecolor="none",
                 linewidth=0.0,
-                zorder=1,
+                zorder=float(self.VIZ_Z_ENV_ICON),
             )
             ax.add_patch(tri)
             self._enemy_patches.append(tri)
+
+    def apply_fused_enemy_costs_for_nav_planning(
+        self,
+        fusion_report: dict,
+        router: "Router",
+        *,
+        enemy_landmark_prefix: str,
+        enemy_ground_truth_xy: np.ndarray,
+        peak_cost: float = 500.0,
+        n_sigma: float = 2.0,
+        nav_robot_radius_inflation_m: float | None = None,
+    ) -> None:
+        """
+        Stamp **ellipse‑shaped** 2σ enemy costs using ``P + σ_r² I`` with
+        ``σ_r = Map.NAV_ENEMY_INFLATION_RADIUS_MULT × (COLLISION_DIAMETER / 2)``. A* dilates **hard
+        land** with the same ``σ_r``; cost heat in :meth:`refresh_planning_cost_visual` is masked
+        off land.
+        """
+        per = fusion_report.get("per_landmark", {})
+        gt = np.asarray(enemy_ground_truth_xy, dtype=np.float64).reshape(-1, 2)
+        r_inf = (
+            float(nav_robot_radius_inflation_m)
+            if nav_robot_radius_inflation_m is not None
+            else float(ARobotarium.COLLISION_DIAMETER)
+            * 0.5
+            * float(self.NAV_ENEMY_INFLATION_RADIUS_MULT)
+        )
+        inflate_m2 = float(r_inf) ** 2
+        cost = fused_enemy_belief_cost_field(
+            self.gridmap,
+            per,
+            enemy_landmark_prefix=enemy_landmark_prefix,
+            peak_cost=peak_cost,
+            n_sigma=n_sigma,
+            enemy_ground_truth_xy=gt,
+            robot_isotropic_inflate_m2=inflate_m2,
+        )
+        stamped_pos = np.where(cost < 0.0, 0.0, np.maximum(0.0, cost))
+        self._enemy_stamped_positive = stamped_pos.astype(np.float64, copy=True)
+        self.gridmap.data = cost
+        self._nav_cost_inflation_radius_m = r_inf
+        router.astar_planner = AStarPathPlanner(
+            self.gridmap,
+            cost_inflation_radius_m=0.0,
+            obstacle_inflation_radius_m=r_inf,
+        )
+
+    def refresh_planning_cost_visual(self) -> None:
+        """
+        Discrete **land** underlay, then **enemy‑only** stamped costs (same ellipse field as A*,
+        no isotropic cost dilation) with heat **masked off land** and drawn above the land layer.
+        """
+        if not self._r.show_figure:
+            return
+        ax = self._r._axes_handle
+        h, w = int(self.land_mass_data.shape[0]), int(self.land_mass_data.shape[1])
+        extent = self.gridmap.extent_xy
+        land = self.land_mass_data > 0
+        rgba_base = np.zeros((h, w, 4), dtype=float)
+        rgba_base[land] = mcolors.to_rgba(self.LAND_MASS_COLOR)
+        rgba_base[~land] = (1.0, 1.0, 1.0, 0.0)
+
+        if getattr(self, "_gridmap_im", None) is not None:
+            self._gridmap_im.remove()
+        self._gridmap_im = ax.imshow(
+            np.flipud(rgba_base),
+            extent=extent,
+            origin="lower",
+            interpolation="nearest",
+            zorder=0,
+        )
+
+        if getattr(self, "_enemy_inflated_risk_im", None) is not None:
+            self._enemy_inflated_risk_im.remove()
+            self._enemy_inflated_risk_im = None
+
+        stamped = self._enemy_stamped_positive
+        if stamped is None:
+            return
+        heat = stamped.astype(np.float64, copy=True)
+        heat[land] = 0.0
+        cmax = float(np.max(heat))
+        if cmax < 1e-18:
+            return
+        norm = np.clip(heat / cmax, 0.0, 1.0)
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "enemy_risk",
+            [(0.62, 0.91, 1.0, 1.0), (1.0, 0.75, 0.2, 1.0), (0.75, 0.1, 0.1, 1.0)],
+        )
+        rgba_h = cmap(norm)[..., :4]
+        show = (~land) & (heat > 1e-9 * cmax)
+        alpha = np.where(show, 0.88, 0.0).astype(np.float64)
+        rgba_h[..., 3] = alpha
+        self._enemy_inflated_risk_im = ax.imshow(
+            np.flipud(rgba_h),
+            extent=extent,
+            origin="lower",
+            interpolation="nearest",
+            zorder=float(self.VIZ_Z_ENEMY_COST_HEAT),
+        )
 
 
 class Router:
@@ -414,7 +567,7 @@ class Router:
 
         end_goal = np.array([1.5, -0.35], dtype=np.float64)
 
-        end_goal_s1 = np.array([1.4, -0.65], dtype=np.float64)
+        end_goal_s1 = np.array([1.4, -0.75], dtype=np.float64)
 
         ordered_s1 = np.vstack(
             (
@@ -426,7 +579,7 @@ class Router:
             )
         )
 
-        end_goal_s2 = np.array([1.5, -0.35], dtype=np.float64)
+        end_goal_s2 = np.array([1.5, -0.45], dtype=np.float64)
 
         ordered_s2 = np.vstack(
             (
@@ -438,7 +591,7 @@ class Router:
             )
         )
 
-        end_goal_s3 = np.array([1.4, -0.00], dtype=np.float64)
+        end_goal_s3 = np.array([1.4, 0.1], dtype=np.float64)
 
         ordered_s3 = np.vstack(
             (
@@ -457,36 +610,6 @@ class Router:
         return [
             self._apply_lawn_around_nominal(r, half_w, step, heuristic_weight=1.0) for r in routes
         ]
-
-    def generate_return_to_home_routes(
-        self,
-        current_xy: np.ndarray,
-        initial_conditions: np.ndarray,
-        *,
-        heuristic_weight: float = 1.0,
-    ) -> List[np.ndarray]:
-        """
-        **Return-to-home phase:** for each robot, a single A* polyline from its current ``(x, y)``
-        to that robot's spawn ``(x, y)`` from ``initial_conditions`` (rows ``[x; y; θ]``, column ``i``).
-
-        No intermediate waypoints and no lawnmower — only ``start → home`` per robot.
-        """
-        cur = np.asarray(current_xy, dtype=np.float64).reshape(2, -1)
-        ic = np.asarray(initial_conditions, dtype=np.float64)
-        if ic.ndim != 2 or ic.shape[0] < 2:
-            raise ValueError("initial_conditions must be 2D with at least rows x, y.")
-        n = ic.shape[1]
-        if cur.shape[1] != n:
-            raise ValueError(
-                f"current_xy has {cur.shape[1]} columns, initial_conditions has N={n}."
-            )
-        routes: List[np.ndarray] = []
-        for i in range(n):
-            start = cur[:, i].reshape(1, 2)
-            home = ic[:2, i].reshape(1, 2)
-            ordered = np.vstack((start, home))
-            routes.append(self.chain_astar(ordered, heuristic_weight=heuristic_weight))
-        return routes
 
     @staticmethod
     def _dedupe_consecutive_xy(keys: np.ndarray, atol: float = 1e-7) -> np.ndarray:
@@ -554,7 +677,7 @@ class Router:
             Shape ``(2, N)`` world ENU (m), column ``i`` = robot ``i`` start (e.g. poses from initial conditions).
         waypoints_per_robot
             Length ``N``. Element ``i`` is shape ``(K_i, 2)`` with **additional** goals (not repeating
-            the start). Use ``(0, 2)`` if the robot should only hold at its start (e.g. mothership).
+            the start). Use ``(0, 2)`` if the robot should only hold at its **current** start pose.
         """
         s = np.asarray(starts_xy, dtype=np.float64).reshape(2, -1)
         n = s.shape[1]

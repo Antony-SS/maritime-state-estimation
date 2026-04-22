@@ -6,6 +6,57 @@ from gridmap import GridMap
 import heapq # for astar
 from rps.robotarium_abc import ARobotarium
 
+
+def flat_disk_index_offsets(radius_m: float, resolution: float) -> list[tuple[int, int]]:
+    """Integer (row, col) offsets whose cell-centre distance from origin is ``<= radius_m`` (m)."""
+    if radius_m <= 0.0 or resolution <= 0.0:
+        return [(0, 0)]
+    res = float(resolution)
+    r_cells = int(np.ceil(float(radius_m) / res))
+    out: list[tuple[int, int]] = []
+    for di in range(-r_cells, r_cells + 1):
+        for dj in range(-r_cells, r_cells + 1):
+            if float(np.hypot(di, dj) * res) <= float(radius_m) + 1e-12:
+                out.append((di, dj))
+    return out
+
+
+def max_disk_dilate_nonnegative(
+    sources: np.ndarray,
+    radius_m: float,
+    resolution: float,
+) -> np.ndarray:
+    """
+    Morphological **max** filter with a flat disk of radius ``radius_m`` (greyscale dilation).
+
+    Every cell takes the maximum ``sources`` value over all cells within that disk (isotropic in
+    grid steps × ``resolution``). Preserves sharp peaks but **spreads** them into a thick halo—
+    used after the anisotropic 2σ belief stamp so robot-radius inflation is visible even for
+    near‑degenerate covariances.
+    """
+    s = np.maximum(0.0, np.asarray(sources, dtype=np.float64))
+    h, w = s.shape
+    res = float(resolution)
+    if radius_m <= 0.0 or res <= 0.0:
+        return s.copy()
+    offsets = flat_disk_index_offsets(radius_m, res)
+    out = s.copy()
+    for di, dj in offsets:
+        if di == 0 and dj == 0:
+            continue
+        i0 = max(0, -di)
+        i1 = min(h, h - di)
+        j0 = max(0, -dj)
+        j1 = min(w, w - dj)
+        if i0 >= i1 or j0 >= j1:
+            continue
+        out[i0:i1, j0:j1] = np.maximum(
+            out[i0:i1, j0:j1],
+            s[i0 + di : i1 + di, j0 + dj : j1 + dj],
+        )
+    return out
+
+
 class AStarPathPlanner:
     """
     Path planning over a 2D **cost grid**.  Supports inflation of costs to account for robot size/discretization.
@@ -137,13 +188,18 @@ class AStarPathPlanner:
         path = path[::-1]
         return path
 
+    def rebuild_inflated_map(self) -> None:
+        """Recompute ``inflated_map`` after ``gridmap.data`` (or ``self.data``) changes."""
+        self.data = self.gridmap.data
+        self.inflated_map = self._create_inflated_map()
+
     def _disk_offsets_weights(
         self, radius_m: float, res: float, gaussian: bool
     ) -> list[tuple[int, int, float]]:
         if radius_m <= 0.0 or res <= 0.0:
             return [(0, 0, 1.0)] if not gaussian else []
         r_cells = int(np.ceil(radius_m / res))
-        sigma_m = max(radius_m * 0.5, 1e-9)
+        sigma_m = max(radius_m * 0.5, 1e-9) if gaussian else 1.0
         offsets: list[tuple[int, int, float]] = []
         for di in range(-r_cells, r_cells + 1):
             for dj in range(-r_cells, r_cells + 1):
@@ -195,20 +251,125 @@ class AStarPathPlanner:
 
     def _create_inflated_map(self) -> np.ndarray:
         """
-        Hard obstacles (``data == -1``) dilate with a flat disk in metres; other costs Gaussian-blur
-        in metres using ``_cost_inflation_radius_m``. Dilated obstacle cells are set to ``-1`` last so
-        they always override blurred costs.
+        Hard obstacles (``data == -1``) dilate with a flat disk (robot footprint). Non‑obstacle
+        costs are already **ellipse‑shaped** on ``gridmap.data`` (belief + ``r²I`` inflation in
+        :func:`fused_enemy_belief_cost_field`); this step only clears costs on the dilated obstacle
+        footprint (no isotropic cost blur / max‑disk, which would circularize hazards).
         """
         raw = np.asarray(self.data, dtype=np.float64)
-        h, w = raw.shape
         res = self._resolution
         hard = raw == -1.0
         obstacle_footprint = self._dilate_obstacle_mask(hard, self._obstacle_inflation_radius_m, res)
         sources = np.where(hard, 0.0, raw)
-        cost_field = self._gaussian_inflate(sources, self._cost_inflation_radius_m, res)
+        sources = np.maximum(0.0, sources)
+        cost_field = sources
+        if self._cost_inflation_radius_m > 1e-12:
+            cost_field = max_disk_dilate_nonnegative(
+                sources, self._cost_inflation_radius_m, res
+            )
         out = cost_field
         out[obstacle_footprint] = -1.0
         return out
+
+
+def fused_enemy_belief_cost_field(
+    gridmap: GridMap,
+    per_landmark: dict,
+    *,
+    enemy_landmark_prefix: str,
+    peak_cost: float = 500.0,
+    n_sigma: float = 2.0,
+    cov_regularization: float = 1e-8,
+    enemy_ground_truth_xy: np.ndarray | None = None,
+    fallback_position_variance_m2: float = 0.35**2,
+    min_fused_cov_eigen_m2: float | None = None,
+    robot_isotropic_inflate_m2: float | None = None,
+) -> np.ndarray:
+    """
+    Per-cell traversal cost (float64): **anisotropic** 2σ Mahalanobis stamp from each enemy.
+
+    Robot-size inflation is **covariance isotropic**: ``P ← P + σ_r² I`` with
+    ``σ_r² = robot_isotropic_inflate_m2`` (caller sets e.g. ``(k × robot_collision_radius)²``) before the 2σ
+    field is evaluated. That widens the ellipse along its **principal axes** (adds uncertainty
+    isotropically) instead of morphological max‑disk dilation, which turns every hazard into a
+    circle.
+
+    When ``enemy_ground_truth_xy`` is provided (shape ``(N, 2)``), every enemy index ``0 … N-1``
+    gets a layer: fused mean/covariance when scouts fused that track, otherwise ground truth with
+    ``fallback_position_variance_m2``. Fused covariances are eigenvalue‑floored at
+    ``min_fused_cov_eigen_m2`` (default ~ a few grid cells) so the 2σ footprint is never
+    sub‑resolution. Hard obstacles (``gridmap.data < 0``) stay ``-1``.
+    """
+    base = np.asarray(gridmap.data, dtype=np.float64)
+    h, w = base.shape
+    obstacle = base < 0.0
+    out = np.where(obstacle, -1.0, 0.0)
+    x_row, _y_grid = gridmap.cell_centers_xy()
+    x_grid = np.broadcast_to(x_row[np.newaxis, :], (h, w))
+    y_grid = _y_grid
+    n_sig = max(float(n_sigma), 1e-9)
+    peak = float(peak_cost)
+    reg = float(cov_regularization) * np.eye(2, dtype=np.float64)
+    res = float(gridmap.resolution)
+    lam_floor = float(min_fused_cov_eigen_m2) if min_fused_cov_eigen_m2 is not None else (2.5 * res) ** 2
+    r2 = float(robot_isotropic_inflate_m2) if robot_isotropic_inflate_m2 is not None else 0.0
+    if r2 < 0.0:
+        r2 = 0.0
+
+    def stamp_layer(mu: np.ndarray, p_mat: np.ndarray) -> None:
+        nonlocal out
+        p2 = 0.5 * (p_mat + p_mat.T) + reg
+        if r2 > 0.0:
+            p2 = p2 + r2 * np.eye(2, dtype=np.float64)
+        inv_p = np.linalg.inv(p2)
+        dx = x_grid - float(mu[0])
+        dy = y_grid - float(mu[1])
+        d2 = inv_p[0, 0] * dx * dx + 2.0 * inv_p[0, 1] * dx * dy + inv_p[1, 1] * dy * dy
+        d2 = np.clip(d2, 0.0, None)
+        d = np.sqrt(d2)
+        wgt = np.clip(1.0 - (d / n_sig) ** 2, 0.0, 1.0)
+        layer = peak * (wgt**2)
+        out = np.where(obstacle, -1.0, out + layer)
+
+    if enemy_ground_truth_xy is not None:
+        gt = np.asarray(enemy_ground_truth_xy, dtype=np.float64).reshape(-1, 2)
+        p_fb = np.eye(2, dtype=np.float64) * float(fallback_position_variance_m2)
+        for ei in range(gt.shape[0]):
+            key = f"{enemy_landmark_prefix}{ei}"
+            stats = per_landmark.get(key, {})
+            if int(stats.get("n_sources", 0) or 0) > 0:
+                fused_xy = stats.get("fused_xy_m")
+                fused_cov = stats.get("fused_cov_m2")
+                if fused_xy is None or fused_cov is None:
+                    stamp_layer(gt[ei], p_fb)
+                    continue
+                mu = np.asarray(fused_xy, dtype=np.float64).reshape(2)
+                p = np.asarray(fused_cov, dtype=np.float64).reshape(2, 2)
+                p = 0.5 * (p + p.T)
+                lam, vecs = np.linalg.eigh(p)
+                lam = np.maximum(lam, lam_floor)
+                p_eff = vecs @ np.diag(lam) @ vecs.T
+                stamp_layer(mu, p_eff)
+            else:
+                stamp_layer(gt[ei], p_fb)
+    else:
+        for lm_type, stats in per_landmark.items():
+            if not str(lm_type).startswith(enemy_landmark_prefix):
+                continue
+            if int(stats.get("n_sources", 0) or 0) <= 0:
+                continue
+            fused_xy = stats.get("fused_xy_m")
+            fused_cov = stats.get("fused_cov_m2")
+            if fused_xy is None or fused_cov is None:
+                continue
+            mu = np.asarray(fused_xy, dtype=np.float64).reshape(2)
+            p = np.asarray(fused_cov, dtype=np.float64).reshape(2, 2)
+            p = 0.5 * (p + p.T)
+            lam, vecs = np.linalg.eigh(p)
+            lam = np.maximum(lam, lam_floor)
+            p_eff = vecs @ np.diag(lam) @ vecs.T
+            stamp_layer(mu, p_eff)
+    return out
 
 
 def _xy_cov_ellipse_width_height_angle_deg(P_xy: np.ndarray, n_sigma: 1.0) -> tuple[float, float, float]:

@@ -53,7 +53,11 @@ class GridMap:
         if self.data is None:
             self.data = np.zeros((height, width), dtype=np.int32)
         else:
-            self.data = np.asarray(self.data, dtype=np.int32)
+            arr = np.asarray(self.data)
+            if np.issubdtype(arr.dtype, np.floating):
+                self.data = arr.astype(np.float64, copy=False)
+            else:
+                self.data = arr.astype(np.int32, copy=False)
 
         expected = (height, width)
         if self.data.shape != expected:
