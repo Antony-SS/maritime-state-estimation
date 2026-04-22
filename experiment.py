@@ -75,6 +75,17 @@ PATH_VERTEX_CATCHUP_M = 0.065
 
 # Distinct colors for GT / KF trails and covariance ellipses (Robotarium default N is small).
 _ROBOT_COLORS = ("tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown")
+# Brighter hues for dashed EKF trails (easier on a dim projector).
+_ROBOT_KF_COLORS = (
+    "#4db8ff",
+    "#ffb84d",
+    "#5ee85e",
+    "#ff7070",
+    "#d896ff",
+    "#e0a060",
+)
+# Landmark / fused enemy outline (brighter than dark crimson #922b21).
+_VIZ_ENEMY_LM_EDGE = "#ff5050"
 
 
 
@@ -182,9 +193,10 @@ def _refresh_plot_with_fused_landmarks(
         if lm_type.startswith(_LM_PREFIX_BUOY):
             edge = "#b8860b"
         elif lm_type.startswith(_LM_PREFIX_ENEMY_SHIP):
-            edge = "#922b21"
+            edge = _VIZ_ENEMY_LM_EDGE
         else:
             edge = "0.35"
+        lw_fused = 2.2 if lm_type.startswith(_LM_PREFIX_ENEMY_SHIP) else 1.45
         ell = mpatches.Ellipse(
             (float(xy[0]), float(xy[1])),
             width=float(ew),
@@ -192,7 +204,7 @@ def _refresh_plot_with_fused_landmarks(
             angle=float(eang),
             fill=False,
             edgecolor=edge,
-            linewidth=1.25,
+            linewidth=lw_fused,
             linestyle="-",
             zorder=float(Map.VIZ_Z_FUSED_LM),
         )
@@ -909,6 +921,7 @@ def run_experiment(
 
     ax = r._axes_handle
     colors = [_ROBOT_COLORS[i % len(_ROBOT_COLORS)] for i in range(n)]
+    kf_colors = [_ROBOT_KF_COLORS[i % len(_ROBOT_KF_COLORS)] for i in range(n)]
 
     gt_trails: list = []
     kf_trails: list = []
@@ -918,17 +931,19 @@ def run_experiment(
     fused_landmark_overlay: list[mpatches.Ellipse] = []
     for i in range(n):
         c = colors[i]
-        lw = 1.45 if i == MOTHERSHIP_INDEX else 1.2
-        gt_line, = ax.plot([], [], "-", color=c, linewidth=lw, zorder=float(Map.VIZ_Z_GT_KF_TRAIL))
-        kf_line, = ax.plot([], [], "--", color=c, linewidth=1.2, zorder=float(Map.VIZ_Z_GT_KF_TRAIL))
+        ckf = kf_colors[i]
+        lw_gt = 1.55 if i == MOTHERSHIP_INDEX else 1.38
+        lw_kf = 2.05
+        gt_line, = ax.plot([], [], "-", color=c, linewidth=lw_gt, zorder=float(Map.VIZ_Z_GT_KF_TRAIL))
+        kf_line, = ax.plot([], [], "--", color=ckf, linewidth=lw_kf, zorder=float(Map.VIZ_Z_GT_KF_TRAIL))
         ell = mpatches.Ellipse(
             (0.0, 0.0),
             width=1e-6,
             height=1e-6,
             angle=0.0,
             fill=False,
-            edgecolor=c,
-            linewidth=1.1,
+            edgecolor=ckf,
+            linewidth=1.45,
             linestyle=(0, (3, 2)),
             zorder=float(Map.VIZ_Z_POSE_COV),
         )
@@ -963,7 +978,13 @@ def run_experiment(
             label="Enemy ship",
         ),
     ]
-    ax.legend(handles=map_legend_handles, loc="upper right", fontsize=8, framealpha=0.9)
+    ax.legend(
+        handles=map_legend_handles,
+        loc="upper right",
+        bbox_to_anchor=(0.99, 0.925),
+        fontsize=8,
+        framealpha=0.9,
+    )
 
     gt_history: list[list[np.ndarray]] = [[] for _ in range(n)]
     kf_history: list[list[np.ndarray]] = [[] for _ in range(n)]
@@ -1306,7 +1327,7 @@ def run_experiment(
                     angle=0.0,
                     fill=False,
                     edgecolor="#b8860b",
-                    linewidth=0.95,
+                    linewidth=1.15,
                     linestyle=":",
                     zorder=float(Map.VIZ_Z_LM_COV),
                 )
@@ -1329,10 +1350,13 @@ def run_experiment(
                 e_lm.set_angle(eang_lm)
                 if lm_type.startswith(_LM_PREFIX_BUOY):
                     e_lm.set_edgecolor("#b8860b")
+                    e_lm.set_linewidth(1.25)
                 elif lm_type.startswith(_LM_PREFIX_ENEMY_SHIP):
-                    e_lm.set_edgecolor("#922b21")
+                    e_lm.set_edgecolor(_VIZ_ENEMY_LM_EDGE)
+                    e_lm.set_linewidth(1.5)
                 else:
                     e_lm.set_edgecolor("0.35")
+                    e_lm.set_linewidth(1.15)
 
         if simulate_death and death_overlay[0] is not None:
             t = death_overlay[0]
