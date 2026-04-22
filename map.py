@@ -90,7 +90,7 @@ class Map:
     LAND_MASS_COLOR: str = "#c5fbc8"
 
     # OCEAN PARAMETERS
-    OCEAN_COLOR = "#9ee9ff"
+    OCEAN_COLOR = "#c4f3ff"
     OCEAN_EDGE_COLOR = "none"
 
     # GRIDMAP COLOR KEY

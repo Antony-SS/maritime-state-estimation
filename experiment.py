@@ -196,7 +196,7 @@ def _refresh_plot_with_fused_landmarks(
             edge = _VIZ_ENEMY_LM_EDGE
         else:
             edge = "0.35"
-        lw_fused = 2.2 if lm_type.startswith(_LM_PREFIX_ENEMY_SHIP) else 1.45
+        lw_fused = 2.65 if lm_type.startswith(_LM_PREFIX_ENEMY_SHIP) else 1.45
         ell = mpatches.Ellipse(
             (float(xy[0]), float(xy[1])),
             width=float(ew),
@@ -1353,7 +1353,7 @@ def run_experiment(
                     e_lm.set_linewidth(1.25)
                 elif lm_type.startswith(_LM_PREFIX_ENEMY_SHIP):
                     e_lm.set_edgecolor(_VIZ_ENEMY_LM_EDGE)
-                    e_lm.set_linewidth(1.5)
+                    e_lm.set_linewidth(2.35)
                 else:
                     e_lm.set_edgecolor("0.35")
                     e_lm.set_linewidth(1.15)
