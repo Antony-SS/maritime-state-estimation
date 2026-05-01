@@ -24,6 +24,9 @@ GT/KF/landmark/offline logging stop after fusion (mothership does not run A* nav
 Optional ``FILTER_EKF_PRIOR_*_M`` constants at top of this file override only the EKF / plot priors
 (simulator ``r.*`` still used for encoders and ``v_hat``/``w_hat`` logs).
 
+Optional ``--oracle``: after each encoder predict, both scout EKFs receive a near-perfect pose
+measurement toward Robotarium ground truth (see ``ORACLE_POSE_MEASUREMENT_*`` and ``update_pose_measurement``).
+
 Optional ``--simulate-death``: during scouting, robot 2 freezes at its pose and a large × is drawn
 if it passes within ``SIMULATE_DEATH_ENEMY_PROXIMITY_M`` of a true enemy ship (visualization only).
 """
@@ -87,6 +90,10 @@ PATH_VERTEX_CATCHUP_M = 0.065
 # old nominal (e.g. ``FILTER_EKF_PRIOR_BASE_LENGTH_M = 0.11`` while ``ARobotarium.BASE_LENGTH`` is 0.14).
 FILTER_EKF_PRIOR_WHEEL_RADIUS_M: float | None = None
 FILTER_EKF_PRIOR_BASE_LENGTH_M: float | None = None
+
+# ``--oracle``: synthetic pose measurement toward ground truth (tiny R for numerical stability).
+ORACLE_POSE_MEASUREMENT_VAR_XY_M2 = 1e-8
+ORACLE_POSE_MEASUREMENT_VAR_THETA_RAD2 = 1e-12
 
 # Distinct colors for GT / KF trails and covariance ellipses (Robotarium default N is small).
 _ROBOT_COLORS = ("tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown")
@@ -646,6 +653,9 @@ def _write_offline_experiment_npz(
     skip_nav: bool = False,
     ekf_prior_wheel_radius_m: float,
     ekf_prior_base_length_m: float,
+    oracle_pose_updates: bool = False,
+    oracle_pose_var_xy_m2: float,
+    oracle_pose_var_theta_rad2: float,
 ) -> None:
     """
     Write NPZ bundles under ``root`` for offline replay / analysis.
@@ -895,9 +905,14 @@ def _write_offline_experiment_npz(
         fusion_report=np.asarray(fusion_report, dtype=object),
         dual_scout_ekf=np.bool_(True),
         skip_nav=np.bool_(skip_nav),
+        oracle_pose_updates=np.bool_(oracle_pose_updates),
+        oracle_pose_var_xy_m2=np.float64(oracle_pose_var_xy_m2),
+        oracle_pose_var_theta_rad2=np.float64(oracle_pose_var_theta_rad2),
         note=(
             "fusion_report is the post-scout map-fusion dict from vanilla scout tracks (allow_pickle=True). "
             "dual_scout_ekf: vanilla + parameter-augmented filters run in parallel each timestep. "
+            "oracle_pose_updates: each scout timestep, ground-truth pose injected as a linear pose "
+            "measurement with variances oracle_pose_var_* (see experiment.py constants). "
             "sim_step in measurement files indexes poses[*] at the same timestep."
         ),
     )
@@ -996,6 +1011,7 @@ def run_experiment(
     offline_log_root: Path | None = None,
     measurement_rng_seed: int | None = None,
     skip_nav: bool = False,
+    oracle: bool = False,
 ) -> None:
     _ = cycles  # reserved for multi-phase / repeat missions
 
@@ -1051,6 +1067,13 @@ def run_experiment(
     encoder_ang_vel_var = (encoder_noise_std * counts_to_rad / dt) ** 2
     encoder_noise_matrix = np.eye(2) * encoder_ang_vel_var
     process_noise_matrix = np.eye(3) * np.array(process_noise)
+    R_oracle_pose = np.diag(
+        [
+            float(ORACLE_POSE_MEASUREMENT_VAR_XY_M2),
+            float(ORACLE_POSE_MEASUREMENT_VAR_XY_M2),
+            float(ORACLE_POSE_MEASUREMENT_VAR_THETA_RAD2),
+        ]
+    ).astype(np.float64)
 
     ekfs_vanilla: list[UnicycleEKF | None] = [None] * n
     ekfs_params: list[UnicycleEKF | None] = [None] * n
@@ -1327,6 +1350,19 @@ def run_experiment(
                 ekfs_vanilla[i].predict(float(dphi_R[i]), float(dphi_L[i]), dt)
                 ekfs_params[i].predict(float(dphi_R[i]), float(dphi_L[i]), dt)
         encoders_prev = encoders_curr.copy()
+
+        if log_and_filter_scout_and_gt and oracle:
+            for i in range(MOTHERSHIP_INDEX + 1, n):
+                if nav_phase:
+                    continue
+                if simulate_death and scout_robot_dead and i == SIMULATE_DEATH_SCOUT_INDEX:
+                    continue
+                z_pose = np.asarray(
+                    [float(x[0, i]), float(x[1, i]), float(x[2, i])],
+                    dtype=np.float64,
+                )
+                ekfs_vanilla[i].update_pose_measurement(z_pose, R_oracle_pose)
+                ekfs_params[i].update_pose_measurement(z_pose, R_oracle_pose)
 
         if log_and_filter_scout_and_gt:
             for i in range(MOTHERSHIP_INDEX + 1, n):
@@ -1751,6 +1787,9 @@ def run_experiment(
             skip_nav=skip_nav,
             ekf_prior_wheel_radius_m=float(ekf_wheel_radius),
             ekf_prior_base_length_m=float(ekf_base_length),
+            oracle_pose_updates=bool(oracle),
+            oracle_pose_var_xy_m2=float(ORACLE_POSE_MEASUREMENT_VAR_XY_M2),
+            oracle_pose_var_theta_rad2=float(ORACLE_POSE_MEASUREMENT_VAR_THETA_RAD2),
         )
 
     r.debug()
@@ -1815,6 +1854,15 @@ def parse_args():
             "GT/KF/landmark logging, and offline bundles end right after map fusion for faster iteration."
         ),
     )
+    p.add_argument(
+        "--oracle",
+        action="store_true",
+        help=(
+            "After each encoder predict, inject ground-truth Robotarium pose (x,y,theta) into both scout "
+            "EKFs as a linear pose measurement with tiny covariance (see ORACLE_POSE_MEASUREMENT_* in "
+            "experiment.py). Use to study parameter estimates when pose is essentially known."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1829,6 +1877,7 @@ def main():
         offline_log_root=args.save_offline,
         measurement_rng_seed=args.measurement_seed,
         skip_nav=bool(args.skip_nav),
+        oracle=bool(args.oracle),
     )
 
 

@@ -101,6 +101,34 @@ class UnicycleEKF:
         self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ R @ K.T
         self.state = self.state + K @ (gps_measurement - H @ self.state)
 
+    def update_pose_measurement(self, xy_theta: np.ndarray, R_pose: np.ndarray) -> None:
+        """Linear-Gaussian update on the robot pose block ``(x, y, theta)``.
+
+        Measurement model: ``z = [x, y, theta]^T + noise``. Heading innovation is wrapped to
+        ``[-pi, pi]``. ``R_pose`` must be ``3×3`` (typically tiny diagonal for oracle / pseudo-GNSS).
+        """
+        z = np.asarray(xy_theta, dtype=np.float64).reshape(3)
+        R = np.asarray(R_pose, dtype=np.float64).reshape(3, 3)
+        n = int(self.state.shape[0])
+        H = np.zeros((3, n), dtype=np.float64)
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 2] = 1.0
+        hx = float(self.state[0])
+        hy = float(self.state[1])
+        ht = wrap_angle(float(self.state[2]))
+        zt = wrap_angle(float(z[2]))
+        innov = np.array(
+            [float(z[0]) - hx, float(z[1]) - hy, wrap_angle(zt - ht)],
+            dtype=np.float64,
+        )
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ innov
+        self.state[2] = wrap_angle(float(self.state[2]))
+        I = np.eye(n, dtype=np.float64)
+        self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ R @ K.T
+
     def _get_landmark_estimate(self, landmark_index: int) -> np.ndarray:
         """ Get the estimate of a landmark from the state vector. """
         i0 = self.base_state_size + landmark_index * 2
