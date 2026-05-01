@@ -1,6 +1,7 @@
 """
-Maritime-style experiment: multi-robot scouting polylines, one decentralized UnicycleEKF per scout
-(robot 0 is a mothership with assumed perfect GNSS — no filter, SLAM, or RMSE on that agent),
+Maritime-style experiment: multi-robot scouting polylines, two parallel decentralized UnicycleEKFs
+per scout (vanilla pose SLAM on the figure + parameter-augmented SLAM logged offline; robot 0 is a
+mothership with assumed perfect GNSS — no filter, SLAM, or RMSE on that agent),
 tiered lighthouse updates (bearing + range when close, bearing-only farther out; see ``Map``),
 and SLAM-style bearing/range to static enemy ships when nearby (unknown landmarks).
 
@@ -13,9 +14,12 @@ their scout endpoints; lighthouse / landmark measurements are paused during Nav.
 
 Use ``--save-offline [DIR]`` to write NPZ bundles (poses, encoders, ``get_orientations()`` headings,
 simulated lighthouse / enemy / buoy events with ``sim_step`` and ``wall_time_unix_s``, EKF trajectories,
-and metadata) for offline analysis. With ``--estimate-robot-parameters``, logs also include per-scout
-``ekf_kinematics_m`` (wheel radii and base length) under ``predicted_paths/`` and a PNG time-series plot
-(saved right after map fusion). Use ``--skip-nav`` to skip the nav ``while`` loop; scout EKF and
+and metadata) for offline analysis. Each run uses **two** scout EKFs in parallel (same measurements):
+a vanilla pose-only filter (shown on the Robotarium figure) and a parameter-augmented filter (logged).
+``predicted_paths/`` includes both trajectories, landmark snapshots for both, per-scout kinematic
+estimates from the augmented filter, and **pose/parameter variance diagonals only** (no landmark
+covariance). A PNG time-series of kinematic estimates is saved right after map fusion. Use ``--skip-nav``
+to skip the nav ``while`` loop; scout EKF and
 GT/KF/landmark/offline logging stop after fusion (mothership does not run A* nav in that mode).
 Optional ``FILTER_EKF_PRIOR_*_M`` constants at top of this file override only the EKF / plot priors
 (simulator ``r.*`` still used for encoders and ``v_hat``/``w_hat`` logs).
@@ -117,6 +121,15 @@ def _ekf_landmark_xy_cov(
         P_lm = 0.5 * (P_lm + P_lm.T)
         return x, P_lm
     return None
+
+
+def _ekf_pose_and_param_variance_diag(ekf: UnicycleEKF) -> np.ndarray:
+    """Diagonal variances for robot block only: (x,y,theta) or (x,y,theta,r_R,r_L,b); excludes landmarks."""
+    bs = int(ekf.base_state_size)
+    P = np.asarray(ekf.P, dtype=np.float64)
+    if P.ndim != 2 or P.shape[0] != P.shape[1] or P.shape[0] < bs:
+        return np.full(bs, np.nan, dtype=np.float64)
+    return np.maximum(np.diagonal(P)[:bs].astype(np.float64, copy=False), 0.0)
 
 
 def _fuse_gaussian_beliefs_information_form(
@@ -455,9 +468,10 @@ def _build_rmse_report(
     }
 
 
-def _print_rmse_report(report: dict) -> None:
+def _print_rmse_report_section(report: dict, *, heading: str) -> None:
     ships = report["ships"]
-    print("\n=== RMSE: ship pose vs ground truth ===")
+    print(f"\n{heading}")
+    print("=== RMSE: ship pose vs ground truth ===")
     for block in ships["per_robot"]:
         i = block["robot_index"]
         p = block["pose_vs_ground_truth"]
@@ -491,10 +505,14 @@ def _print_rmse_report(report: dict) -> None:
         f"\n  Landmarks pooled (filtered robots only, all timesteps):  RMSE position = "
         f"{lt['rmse_position_m']:.4f} m  n={lt['n_samples']}"
     )
-    fusion = report.get("map_fusion_landmarks")
-    if fusion:
-        print("\n=== RMSE: map-fused landmark XY vs ground truth (end of mission) ===")
-        agg = fusion.get("aggregate_vs_ground_truth") or {}
+
+
+def _print_rmse_report_dual(vanilla_block: dict, params_block: dict, fusion_report: dict) -> None:
+    _print_rmse_report_section(vanilla_block, heading="=== Vanilla EKF (shown on Robotarium figure) ===")
+    _print_rmse_report_section(params_block, heading="=== Parameter-augmented EKF (logged only) ===")
+    if fusion_report:
+        print("\n=== RMSE: map-fused landmark XY vs ground truth (vanilla scout tracks, end of mission) ===")
+        agg = fusion_report.get("aggregate_vs_ground_truth") or {}
         if agg:
             print(
                 f"  Fused landmarks (mean over objects with GT):  RMSE position = "
@@ -504,7 +522,7 @@ def _print_rmse_report(report: dict) -> None:
             )
         else:
             print("  (no fused landmarks with ground truth to aggregate)")
-        for name, stats in sorted(fusion.get("per_landmark", {}).items()):
+        for name, stats in sorted(fusion_report.get("per_landmark", {}).items()):
             if stats.get("n_sources", 0) == 0:
                 print(f"  {name}:  (no scout track)")
                 continue
@@ -524,6 +542,19 @@ def _save_rmse_yaml(report: dict, path: Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, sort_keys=False)
         f.write("\n")
+
+
+def _dual_rmse_metric_paths(base: Path) -> tuple[Path, Path]:
+    """
+    From a single stem path (e.g. ``.../experiment_rmse_metrics.yaml``), return paths for the
+    vanilla (on-figure) filter and the parameter-augmented filter.
+    """
+    base = Path(base)
+    if not base.suffix:
+        base = base.with_suffix(".yaml")
+    stem, suf = base.stem, base.suffix
+    parent = base.parent
+    return (parent / f"{stem}_vanilla{suf}", parent / f"{stem}_parameter{suf}")
 
 
 def _save_scout_kinematics_figure(
@@ -605,10 +636,13 @@ def _write_offline_experiment_npz(
     gt_history: list[list[np.ndarray]],
     kf_history: list[list[np.ndarray]],
     landmark_history: list[list[dict[str, list[float]]]],
+    kf_history_params: list[list[np.ndarray]],
+    landmark_history_params: list[list[dict[str, list[float]]]],
     routes: list,
     fusion_report: dict,
-    estimate_robot_parameters: bool = False,
-    kf_kinematics_history: list[list[np.ndarray]] | None = None,
+    kf_kinematics_history: list[list[np.ndarray]],
+    cov_var_pose_vanilla: list[list[np.ndarray]],
+    cov_var_pose_and_params: list[list[np.ndarray]],
     skip_nav: bool = False,
     ekf_prior_wheel_radius_m: float,
     ekf_prior_base_length_m: float,
@@ -624,8 +658,10 @@ def _write_offline_experiment_npz(
     - ``lighthouse_measurements/`` — event arrays + ``wall_time_unix_s``
     - ``enemy_measurements/`` — bearing/range SLAM events to enemy ships
     - ``buoy_measurements/`` — same for buoys (may be length 0)
-    - ``predicted_paths/`` — stacked GT and EKF pose trajectories + ``landmark_snapshots`` (object array);
-      if ``estimate_robot_parameters``, also ``ekf_kinematics_m`` (T,n,3) = [r_R, r_L, b] in meters (NaN for mothership / unused).
+    - ``predicted_paths/`` — GT + vanilla ``ekf_poses_xy_theta`` + param ``ekf_poses_xy_theta_params``,
+      ``landmark_snapshots`` / ``landmark_snapshots_params``, ``ekf_kinematics_m`` (T,n,3) from the
+      augmented filter, ``ekf_pose_variance_diag_vanilla`` (T,n,3) and ``ekf_pose_and_param_variance_diag``
+      (T,n,6) — **robot block diagonal variances only** (no landmark entries). NaN for mothership / padding.
     - ``metadata/`` — ``wheel_radius``/``base_length`` from Robotarium; ``filter_ekf_prior_*`` = EKF init/plot priors.
     """
     root = Path(root).resolve()
@@ -781,31 +817,51 @@ def _write_offline_experiment_npz(
         axis=1,
     )
     kf_nan = np.full((T, n_robots, 3), np.nan, dtype=np.float64)
+    kf_params_nan = np.full((T, n_robots, 3), np.nan, dtype=np.float64)
     for i in range(n_robots):
         if i == mothership_index:
             continue
         kf_stack_i = np.asarray(kf_history[i], dtype=np.float64).reshape(T, 3)
         kf_nan[:, i, :] = kf_stack_i
+        kfp = np.asarray(kf_history_params[i], dtype=np.float64).reshape(T, 3)
+        kf_params_nan[:, i, :] = kfp
     pred_kw: dict = dict(
         gt_poses_xy_theta=gt_stack,
         ekf_poses_xy_theta=kf_nan,
+        ekf_poses_xy_theta_params=kf_params_nan,
         sim_time_s=sim_time,
         nav_phase=nav_arr,
         landmark_snapshots=np.asarray(landmark_history, dtype=object),
+        landmark_snapshots_params=np.asarray(landmark_history_params, dtype=object),
         note=(
-            "landmark_snapshots[i][t] is dict landmark_type -> [x,y] for robot i; load with allow_pickle=True. "
-            "When estimate_robot_parameters, ekf_kinematics_m (T,n,3) holds [r_R,r_L,b] per robot (NaN for mothership)."
+            "landmark_snapshots = vanilla EKF (on-figure); landmark_snapshots_params = parameter-augmented EKF. "
+            "ekf_kinematics_m (T,n,3) = [r_R,r_L,b] from augmented filter. "
+            "ekf_pose_variance_diag_vanilla (T,n,3) = diag(P) for (x,y,theta) block only. "
+            "ekf_pose_and_param_variance_diag (T,n,6) adds (var r_R, var r_L, var b) for augmented filter."
         ),
     )
-    if estimate_robot_parameters and kf_kinematics_history is not None:
-        kin_nan = np.full((T, n_robots, 3), np.nan, dtype=np.float64)
-        for i in range(n_robots):
-            if i == mothership_index:
-                continue
-            arr = np.asarray(kf_kinematics_history[i], dtype=np.float64).reshape(-1, 3)
-            if arr.shape[0] == T:
-                kin_nan[:, i, :] = arr
-        pred_kw["ekf_kinematics_m"] = kin_nan
+    kin_nan = np.full((T, n_robots, 3), np.nan, dtype=np.float64)
+    for i in range(n_robots):
+        if i == mothership_index:
+            continue
+        arr = np.asarray(kf_kinematics_history[i], dtype=np.float64).reshape(-1, 3)
+        if arr.shape[0] == T:
+            kin_nan[:, i, :] = arr
+    pred_kw["ekf_kinematics_m"] = kin_nan
+
+    var_v = np.full((T, n_robots, 3), np.nan, dtype=np.float64)
+    var_p = np.full((T, n_robots, 6), np.nan, dtype=np.float64)
+    for i in range(n_robots):
+        if i == mothership_index:
+            continue
+        hv = cov_var_pose_vanilla[i]
+        hp = cov_var_pose_and_params[i]
+        if len(hv) == T:
+            var_v[:, i, :] = np.stack([np.asarray(v, dtype=np.float64).reshape(3) for v in hv], axis=0)
+        if len(hp) == T:
+            var_p[:, i, :] = np.stack([np.asarray(v, dtype=np.float64).reshape(6) for v in hp], axis=0)
+    pred_kw["ekf_pose_variance_diag_vanilla"] = var_v
+    pred_kw["ekf_pose_and_param_variance_diag"] = var_p
     np.savez_compressed(d_pred / "predicted_paths.npz", **pred_kw)
 
     lh_names = np.asarray(list(lighthouses.keys()), dtype=object)
@@ -837,9 +893,13 @@ def _write_offline_experiment_npz(
         mothership_nav_goal_xy_m=np.asarray(nav_goal_xy, dtype=np.float64).reshape(2),
         routes=routes_obj,
         fusion_report=np.asarray(fusion_report, dtype=object),
-        estimate_robot_parameters=np.bool_(estimate_robot_parameters),
+        dual_scout_ekf=np.bool_(True),
         skip_nav=np.bool_(skip_nav),
-        note="fusion_report is the post-scout map-fusion dict (allow_pickle=True). sim_step in measurement files indexes poses[*] at the same timestep.",
+        note=(
+            "fusion_report is the post-scout map-fusion dict from vanilla scout tracks (allow_pickle=True). "
+            "dual_scout_ekf: vanilla + parameter-augmented filters run in parallel each timestep. "
+            "sim_step in measurement files indexes poses[*] at the same timestep."
+        ),
     )
     print(f"\nOffline experiment NPZ bundles written under {root}")
 
@@ -935,7 +995,6 @@ def run_experiment(
     simulate_death: bool = False,
     offline_log_root: Path | None = None,
     measurement_rng_seed: int | None = None,
-    estimate_robot_parameters: bool = False,
     skip_nav: bool = False,
 ) -> None:
     _ = cycles  # reserved for multi-phase / repeat missions
@@ -993,16 +1052,27 @@ def run_experiment(
     encoder_noise_matrix = np.eye(2) * encoder_ang_vel_var
     process_noise_matrix = np.eye(3) * np.array(process_noise)
 
-    ekfs: list[UnicycleEKF | None] = [None] * n
+    ekfs_vanilla: list[UnicycleEKF | None] = [None] * n
+    ekfs_params: list[UnicycleEKF | None] = [None] * n
     for i in range(MOTHERSHIP_INDEX + 1, n):
-        ekfs[i] = UnicycleEKF(
-            initial_state=np.asarray(initial_conditions[:, i], dtype=float).reshape(-1),
+        ic = np.asarray(initial_conditions[:, i], dtype=float).reshape(-1)
+        ekfs_vanilla[i] = UnicycleEKF(
+            initial_state=ic,
             initial_covariance=np.zeros((3, 3)),
             b=ekf_base_length,
             r=ekf_wheel_radius,
             M=encoder_noise_matrix,
             Q=process_noise_matrix,
-            estimate_robot_parameters=estimate_robot_parameters,
+            estimate_robot_parameters=False,
+        )
+        ekfs_params[i] = UnicycleEKF(
+            initial_state=ic,
+            initial_covariance=np.zeros((3, 3)),
+            b=ekf_base_length,
+            r=ekf_wheel_radius,
+            M=encoder_noise_matrix,
+            Q=process_noise_matrix,
+            estimate_robot_parameters=True,
         )
 
     R_range_var = float(Map.LIGHTHOUSE_RANGE_MEAS_VAR_M2)
@@ -1086,8 +1156,12 @@ def run_experiment(
 
     gt_history: list[list[np.ndarray]] = [[] for _ in range(n)]
     kf_history: list[list[np.ndarray]] = [[] for _ in range(n)]
+    kf_history_params: list[list[np.ndarray]] = [[] for _ in range(n)]
     kf_kinematics_history: list[list[np.ndarray]] = [[] for _ in range(n)]
     landmark_history: list[list[dict[str, list[float]]]] = [[] for _ in range(n)]
+    landmark_history_params: list[list[dict[str, list[float]]]] = [[] for _ in range(n)]
+    cov_var_pose_vanilla: list[list[np.ndarray]] = [[] for _ in range(n)]
+    cov_var_pose_and_params: list[list[np.ndarray]] = [[] for _ in range(n)]
     encoders_prev = r.get_encoders()
 
     offline_root = Path(offline_log_root).resolve() if offline_log_root is not None else None
@@ -1129,7 +1203,7 @@ def run_experiment(
     log_and_filter_scout_and_gt = True
 
     def _save_kinematics_figures_after_fusion() -> None:
-        if not estimate_robot_parameters or not gt_history[MOTHERSHIP_INDEX + 1]:
+        if not gt_history[MOTHERSHIP_INDEX + 1]:
             return
         T_plot = len(gt_history[MOTHERSHIP_INDEX + 1])
         sim_plot = np.arange(T_plot, dtype=np.float64) * float(dt)
@@ -1250,7 +1324,8 @@ def run_experiment(
             for i in range(MOTHERSHIP_INDEX + 1, n):
                 if simulate_death and scout_robot_dead and i == SIMULATE_DEATH_SCOUT_INDEX:
                     continue
-                ekfs[i].predict(float(dphi_R[i]), float(dphi_L[i]), dt)
+                ekfs_vanilla[i].predict(float(dphi_R[i]), float(dphi_L[i]), dt)
+                ekfs_params[i].predict(float(dphi_R[i]), float(dphi_L[i]), dt)
         encoders_prev = encoders_curr.copy()
 
         if log_and_filter_scout_and_gt:
@@ -1284,7 +1359,14 @@ def run_experiment(
                             include_bearing=True,
                             include_range=use_range,
                         )
-                        ekfs[i].process_beacon_update(
+                        ekfs_vanilla[i].process_beacon_update(
+                            lh_xy,
+                            z_b,
+                            R_bearing_var,
+                            z_r,
+                            R_range_var if use_range else None,
+                        )
+                        ekfs_params[i].process_beacon_update(
                             lh_xy,
                             z_b,
                             R_bearing_var,
@@ -1329,7 +1411,14 @@ def run_experiment(
                             include_bearing=True,
                             include_range=True,
                         )
-                        ekfs[i].process_landmark_update(
+                        ekfs_vanilla[i].process_landmark_update(
+                            f"{_LM_PREFIX_BUOY}{bname}",
+                            float(zb_lm),
+                            R_bearing_var,
+                            float(zr_lm),
+                            R_range_var,
+                        )
+                        ekfs_params[i].process_landmark_update(
                             f"{_LM_PREFIX_BUOY}{bname}",
                             float(zb_lm),
                             R_bearing_var,
@@ -1369,7 +1458,14 @@ def run_experiment(
                             include_bearing=True,
                             include_range=True,
                         )
-                        ekfs[i].process_landmark_update(
+                        ekfs_vanilla[i].process_landmark_update(
+                            f"{_LM_PREFIX_ENEMY_SHIP}{ei}",
+                            float(zb_lm),
+                            R_bearing_var,
+                            float(zr_lm),
+                            R_range_var,
+                        )
+                        ekfs_params[i].process_landmark_update(
                             f"{_LM_PREFIX_ENEMY_SHIP}{ei}",
                             float(zb_lm),
                             R_bearing_var,
@@ -1409,25 +1505,37 @@ def run_experiment(
                 )
                 if i == MOTHERSHIP_INDEX:
                     landmark_history[i].append({})
+                    landmark_history_params[i].append({})
                     continue
-                st = np.asarray(ekfs[i].state, dtype=float).reshape(-1)
+                st_v = np.asarray(ekfs_vanilla[i].state, dtype=float).reshape(-1)
+                st_p = np.asarray(ekfs_params[i].state, dtype=float).reshape(-1)
                 kf_history[i].append(
-                    np.array([float(st[0]), float(st[1]), float(st[2])], dtype=np.float64)
+                    np.array([float(st_v[0]), float(st_v[1]), float(st_v[2])], dtype=np.float64)
                 )
-                if estimate_robot_parameters:
-                    kf_kinematics_history[i].append(
-                        np.asarray(st[3:6], dtype=np.float64).reshape(3).copy()
-                    )
-                snap: dict[str, list[float]] = {}
-                ekf_i = ekfs[i]
-                b0 = int(ekf_i.base_state_size)
-                for lm_idx in sorted(ekf_i.landmarks.keys()):
-                    lm_type = str(ekf_i.landmarks[lm_idx])
-                    j0 = b0 + 2 * int(lm_idx)
-                    lx = float(st[j0])
-                    ly = float(st[j0 + 1])
-                    snap[lm_type] = [lx, ly]
-                landmark_history[i].append(snap)
+                kf_history_params[i].append(
+                    np.array([float(st_p[0]), float(st_p[1]), float(st_p[2])], dtype=np.float64)
+                )
+                kf_kinematics_history[i].append(
+                    np.asarray(st_p[3:6], dtype=np.float64).reshape(3).copy()
+                )
+                cov_var_pose_vanilla[i].append(_ekf_pose_and_param_variance_diag(ekfs_vanilla[i]))
+                cov_var_pose_and_params[i].append(_ekf_pose_and_param_variance_diag(ekfs_params[i]))
+                snap_v: dict[str, list[float]] = {}
+                ekf_v = ekfs_vanilla[i]
+                b0v = int(ekf_v.base_state_size)
+                for lm_idx in sorted(ekf_v.landmarks.keys()):
+                    lm_type = str(ekf_v.landmarks[lm_idx])
+                    j0 = b0v + 2 * int(lm_idx)
+                    snap_v[lm_type] = [float(st_v[j0]), float(st_v[j0 + 1])]
+                landmark_history[i].append(snap_v)
+                snap_p: dict[str, list[float]] = {}
+                ekf_p = ekfs_params[i]
+                b0p = int(ekf_p.base_state_size)
+                for lm_idx in sorted(ekf_p.landmarks.keys()):
+                    lm_type = str(ekf_p.landmarks[lm_idx])
+                    j0 = b0p + 2 * int(lm_idx)
+                    snap_p[lm_type] = [float(st_p[j0]), float(st_p[j0 + 1])]
+                landmark_history_params[i].append(snap_p)
 
         for i in range(n):
             if not gt_history[i]:
@@ -1443,8 +1551,8 @@ def run_experiment(
             if i == MOTHERSHIP_INDEX:
                 continue
 
-            st = np.asarray(ekfs[i].state, dtype=float).reshape(-1)
-            P_full = np.asarray(ekfs[i].P, dtype=np.float64)
+            st = np.asarray(ekfs_vanilla[i].state, dtype=float).reshape(-1)
+            P_full = np.asarray(ekfs_vanilla[i].P, dtype=np.float64)
             if P_full.ndim != 2 or P_full.shape[0] != P_full.shape[1]:
                 P_full = np.squeeze(P_full)
             Pxy = P_full[:2, :2]
@@ -1454,7 +1562,7 @@ def run_experiment(
             cov_ellipses[i].set_height(eh)
             cov_ellipses[i].set_angle(eang)
 
-            ekf_i = ekfs[i]
+            ekf_i = ekfs_vanilla[i]
             b0 = int(ekf_i.base_state_size)
             # One ellipse per landmark index (each index is a unique object id in ``landmarks``).
             lm_indices = sorted(ekf_i.landmarks.keys())
@@ -1514,8 +1622,9 @@ def run_experiment(
 
     _flash_center_title(r, "Map Fusion Phase")
 
-    fusion_report = _build_map_fusion_landmark_report(ekfs, env_map, enemy_positions)
-    _apply_map_fusion_to_ekf_landmarks(ekfs, fusion_report)
+    fusion_report = _build_map_fusion_landmark_report(ekfs_vanilla, env_map, enemy_positions)
+    _apply_map_fusion_to_ekf_landmarks(ekfs_vanilla, fusion_report)
+    _apply_map_fusion_to_ekf_landmarks(ekfs_params, fusion_report)
     # Kinematics plot uses estimates through map fusion only; logging/EKF for scouts stops before nav.
     _save_kinematics_figures_after_fusion()
     log_and_filter_scout_and_gt = False
@@ -1584,14 +1693,20 @@ def run_experiment(
         nav_phase = False
         skip_next_pose_read = False
 
-    rmse_report = _build_rmse_report(
+    rmse_vanilla = _build_rmse_report(
         gt_history, kf_history, landmark_history, env_map, enemy_positions
     )
-    rmse_report["map_fusion_landmarks"] = fusion_report
-    _print_rmse_report(rmse_report)
-    out_path = rmse_out if rmse_out is not None else (_ROOT / "experiment_rmse_metrics.yaml")
-    _save_rmse_yaml(rmse_report, out_path)
-    print(f"\nRMSE metrics saved to {out_path.resolve()}")
+    rmse_params = _build_rmse_report(
+        gt_history, kf_history_params, landmark_history_params, env_map, enemy_positions
+    )
+    _print_rmse_report_dual(rmse_vanilla, rmse_params, fusion_report)
+    base_rmse = rmse_out if rmse_out is not None else (_ROOT / "experiment_rmse_metrics.yaml")
+    path_vanilla, path_params = _dual_rmse_metric_paths(base_rmse)
+    vanilla_payload = {**rmse_vanilla, "map_fusion_landmarks": fusion_report}
+    _save_rmse_yaml(vanilla_payload, path_vanilla)
+    _save_rmse_yaml(rmse_params, path_params)
+    print(f"\nRMSE metrics (vanilla EKF + map fusion) saved to {path_vanilla.resolve()}")
+    print(f"RMSE metrics (parameter-augmented EKF) saved to {path_params.resolve()}")
 
     if offline_root is not None and meas_seed_for_meta is not None:
         enemy_xy = np.stack(
@@ -1626,10 +1741,13 @@ def run_experiment(
             gt_history=gt_history,
             kf_history=kf_history,
             landmark_history=landmark_history,
+            kf_history_params=kf_history_params,
+            landmark_history_params=landmark_history_params,
             routes=routes,
             fusion_report=fusion_report,
-            estimate_robot_parameters=estimate_robot_parameters,
-            kf_kinematics_history=kf_kinematics_history if estimate_robot_parameters else None,
+            kf_kinematics_history=kf_kinematics_history,
+            cov_var_pose_vanilla=cov_var_pose_vanilla,
+            cov_var_pose_and_params=cov_var_pose_and_params,
             skip_nav=skip_nav,
             ekf_prior_wheel_radius_m=float(ekf_wheel_radius),
             ekf_prior_base_length_m=float(ekf_base_length),
@@ -1657,7 +1775,11 @@ def parse_args():
         "--rmse-out",
         type=Path,
         default=None,
-        help="Path to write RMSE metrics (YAML-compatible JSON). Default: maritime-state-estimation/experiment_rmse_metrics.yaml",
+        help=(
+            "Base path for RMSE metrics (YAML-compatible JSON); two files are written: "
+            "<stem>_vanilla<suffix> (includes map_fusion_landmarks) and <stem>_parameter<suffix>. "
+            "Default base: maritime-state-estimation/experiment_rmse_metrics.yaml"
+        ),
     )
     p.add_argument(
         "--simulate-death",
@@ -1686,17 +1808,6 @@ def parse_args():
         help="Seed for simulated lighthouse / landmark measurements (also used when --save-offline draws RNG).",
     )
     p.add_argument(
-        "--estimate-robot-parameters",
-        "--estimate_robot_parameters",
-        "--est-params",
-        dest="estimate_robot_parameters",
-        action="store_true",
-        help=(
-            "Augment each scout EKF with wheel radii and base length in the state and estimate them "
-            "(default: off; use nominal Robotarium kinematics only)."
-        ),
-    )
-    p.add_argument(
         "--skip-nav",
         action="store_true",
         help=(
@@ -1717,7 +1828,6 @@ def main():
         simulate_death=bool(args.simulate_death),
         offline_log_root=args.save_offline,
         measurement_rng_seed=args.measurement_seed,
-        estimate_robot_parameters=bool(args.estimate_robot_parameters),
         skip_nav=bool(args.skip_nav),
     )
 
