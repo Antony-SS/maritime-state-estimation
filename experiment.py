@@ -13,7 +13,12 @@ their scout endpoints; lighthouse / landmark measurements are paused during Nav.
 
 Use ``--save-offline [DIR]`` to write NPZ bundles (poses, encoders, ``get_orientations()`` headings,
 simulated lighthouse / enemy / buoy events with ``sim_step`` and ``wall_time_unix_s``, EKF trajectories,
-and metadata) for offline analysis.
+and metadata) for offline analysis. With ``--estimate-robot-parameters``, logs also include per-scout
+``ekf_kinematics_m`` (wheel radii and base length) under ``predicted_paths/`` and a PNG time-series plot
+(saved right after map fusion). Use ``--skip-nav`` to skip the nav ``while`` loop; scout EKF and
+GT/KF/landmark/offline logging stop after fusion (mothership does not run A* nav in that mode).
+Optional ``FILTER_EKF_PRIOR_*_M`` constants at top of this file override only the EKF / plot priors
+(simulator ``r.*`` still used for encoders and ``v_hat``/``w_hat`` logs).
 
 Optional ``--simulate-death``: during scouting, robot 2 freezes at its pose and a large × is drawn
 if it passes within ``SIMULATE_DEATH_ENEMY_PROXIMITY_M`` of a true enemy ship (visualization only).
@@ -73,6 +78,12 @@ PATH_TRACK_VEL_LIMIT_M_S = 0.09
 # (helps tight A* corners where projection alone creeps slowly — e.g. scout 1).
 PATH_VERTEX_CATCHUP_M = 0.065
 
+# EKF kinematic prior overrides (optional). ``None`` = use ``Robotarium`` values from ``r``.
+# Set to a float when the simulator constants differ but the filter should still start from the
+# old nominal (e.g. ``FILTER_EKF_PRIOR_BASE_LENGTH_M = 0.11`` while ``ARobotarium.BASE_LENGTH`` is 0.14).
+FILTER_EKF_PRIOR_WHEEL_RADIUS_M: float | None = None
+FILTER_EKF_PRIOR_BASE_LENGTH_M: float | None = None
+
 # Distinct colors for GT / KF trails and covariance ellipses (Robotarium default N is small).
 _ROBOT_COLORS = ("tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown")
 # Brighter hues for dashed EKF trails (easier on a dim projector).
@@ -96,7 +107,8 @@ def _ekf_landmark_xy_cov(
     for idx, typ in ekf.landmarks.items():
         if str(typ) != landmark_type:
             continue
-        sl = slice(3 + 2 * int(idx), 3 + 2 * int(idx) + 2)
+        b0 = int(ekf.base_state_size)
+        sl = slice(b0 + 2 * int(idx), b0 + 2 * int(idx) + 2)
         x = np.asarray(ekf.state[sl], dtype=np.float64).reshape(2)
         P_full = np.asarray(ekf.P, dtype=np.float64)
         if P_full.shape[0] < sl.stop or P_full.shape[1] < sl.stop:
@@ -148,7 +160,8 @@ def _apply_map_fusion_to_ekf_landmarks(ekfs: list[UnicycleEKF | None], fusion_re
             fused_cov = block.get("fused_cov_m2")
             if fused_xy is None or fused_cov is None:
                 continue
-            sl = slice(3 + 2 * int(idx), 3 + 2 * int(idx) + 2)
+            b0 = int(ekf.base_state_size)
+            sl = slice(b0 + 2 * int(idx), b0 + 2 * int(idx) + 2)
             xf = np.asarray(fused_xy, dtype=np.float64).reshape(2)
             Pf = np.asarray(fused_cov, dtype=np.float64).reshape(2, 2)
             Pf = 0.5 * (Pf + Pf.T)
@@ -513,6 +526,56 @@ def _save_rmse_yaml(report: dict, path: Path) -> None:
         f.write("\n")
 
 
+def _save_scout_kinematics_figure(
+    sim_time_s: np.ndarray,
+    kin_m: np.ndarray,
+    *,
+    n_robots: int,
+    mothership_index: int,
+    wheel_radius_nominal_m: float,
+    base_length_nominal_m: float,
+    out_path: Path,
+) -> None:
+    """
+    Plot EKF-estimated right wheel radius, left wheel radius, and base length vs time for each scout.
+
+    ``kin_m`` is (T, n_robots, 3): channels [r_R, r_L, b] in meters; mothership row may be NaN.
+    """
+    out_path = Path(out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    T = int(sim_time_s.shape[0])
+    titles = ("Wheel radius right (m)", "Wheel radius left (m)", "Base length (m)")
+    fig, axes = plt.subplots(3, 1, figsize=(10.0, 8.0), sharex=True, constrained_layout=True)
+    for ax_i, ax in enumerate(axes):
+        for ri in range(n_robots):
+            if ri == mothership_index:
+                continue
+            y = kin_m[:, ri, ax_i]
+            if not np.any(np.isfinite(y)):
+                continue
+            ax.plot(
+                sim_time_s,
+                y,
+                color=_ROBOT_KF_COLORS[ri % len(_ROBOT_KF_COLORS)],
+                linewidth=1.35,
+                label=f"robot {ri}",
+            )
+        if ax_i in (0, 1):
+            ax.axhline(float(wheel_radius_nominal_m), color="0.25", linestyle="--", linewidth=1.0, alpha=0.7)
+        else:
+            ax.axhline(float(base_length_nominal_m), color="0.25", linestyle="--", linewidth=1.0, alpha=0.7)
+        ax.set_ylabel(titles[ax_i])
+        ax.grid(True, alpha=0.35)
+    axes[0].legend(loc="best", fontsize=8)
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle(
+        "EKF kinematic parameter estimates (scouts only; dashed = FILTER_EKF_PRIOR_* or Robotarium)"
+    )
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    print(f"Scout kinematics figure saved to {out_path}")
+
+
 def _write_offline_experiment_npz(
     root: Path,
     *,
@@ -544,6 +607,11 @@ def _write_offline_experiment_npz(
     landmark_history: list[list[dict[str, list[float]]]],
     routes: list,
     fusion_report: dict,
+    estimate_robot_parameters: bool = False,
+    kf_kinematics_history: list[list[np.ndarray]] | None = None,
+    skip_nav: bool = False,
+    ekf_prior_wheel_radius_m: float,
+    ekf_prior_base_length_m: float,
 ) -> None:
     """
     Write NPZ bundles under ``root`` for offline replay / analysis.
@@ -556,8 +624,9 @@ def _write_offline_experiment_npz(
     - ``lighthouse_measurements/`` — event arrays + ``wall_time_unix_s``
     - ``enemy_measurements/`` — bearing/range SLAM events to enemy ships
     - ``buoy_measurements/`` — same for buoys (may be length 0)
-    - ``predicted_paths/`` — stacked GT and EKF pose trajectories + ``landmark_snapshots`` (object array)
-    - ``metadata/`` — scalar parameters, beacon positions, ``routes`` (object array of per-robot polylines)
+    - ``predicted_paths/`` — stacked GT and EKF pose trajectories + ``landmark_snapshots`` (object array);
+      if ``estimate_robot_parameters``, also ``ekf_kinematics_m`` (T,n,3) = [r_R, r_L, b] in meters (NaN for mothership / unused).
+    - ``metadata/`` — ``wheel_radius``/``base_length`` from Robotarium; ``filter_ekf_prior_*`` = EKF init/plot priors.
     """
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -717,15 +786,27 @@ def _write_offline_experiment_npz(
             continue
         kf_stack_i = np.asarray(kf_history[i], dtype=np.float64).reshape(T, 3)
         kf_nan[:, i, :] = kf_stack_i
-    np.savez_compressed(
-        d_pred / "predicted_paths.npz",
+    pred_kw: dict = dict(
         gt_poses_xy_theta=gt_stack,
         ekf_poses_xy_theta=kf_nan,
         sim_time_s=sim_time,
         nav_phase=nav_arr,
         landmark_snapshots=np.asarray(landmark_history, dtype=object),
-        note="landmark_snapshots[i][t] is dict landmark_type -> [x,y] for robot i; load with allow_pickle=True.",
+        note=(
+            "landmark_snapshots[i][t] is dict landmark_type -> [x,y] for robot i; load with allow_pickle=True. "
+            "When estimate_robot_parameters, ekf_kinematics_m (T,n,3) holds [r_R,r_L,b] per robot (NaN for mothership)."
+        ),
     )
+    if estimate_robot_parameters and kf_kinematics_history is not None:
+        kin_nan = np.full((T, n_robots, 3), np.nan, dtype=np.float64)
+        for i in range(n_robots):
+            if i == mothership_index:
+                continue
+            arr = np.asarray(kf_kinematics_history[i], dtype=np.float64).reshape(-1, 3)
+            if arr.shape[0] == T:
+                kin_nan[:, i, :] = arr
+        pred_kw["ekf_kinematics_m"] = kin_nan
+    np.savez_compressed(d_pred / "predicted_paths.npz", **pred_kw)
 
     lh_names = np.asarray(list(lighthouses.keys()), dtype=object)
     lh_xy = np.stack([np.asarray(lighthouses[k], dtype=np.float64).reshape(2) for k in lighthouses], axis=0)
@@ -746,6 +827,8 @@ def _write_offline_experiment_npz(
         R_range_var=np.float64(R_range_var),
         wheel_radius=np.float64(wheel_radius),
         base_length=np.float64(base_length),
+        filter_ekf_prior_wheel_radius_m=np.float64(ekf_prior_wheel_radius_m),
+        filter_ekf_prior_base_length_m=np.float64(ekf_prior_base_length_m),
         counts_to_rad=np.float64(counts_to_rad),
         process_noise_xyz=np.asarray(process_noise, dtype=np.float64).reshape(3),
         lighthouse_names=lh_names,
@@ -754,6 +837,8 @@ def _write_offline_experiment_npz(
         mothership_nav_goal_xy_m=np.asarray(nav_goal_xy, dtype=np.float64).reshape(2),
         routes=routes_obj,
         fusion_report=np.asarray(fusion_report, dtype=object),
+        estimate_robot_parameters=np.bool_(estimate_robot_parameters),
+        skip_nav=np.bool_(skip_nav),
         note="fusion_report is the post-scout map-fusion dict (allow_pickle=True). sim_step in measurement files indexes poses[*] at the same timestep.",
     )
     print(f"\nOffline experiment NPZ bundles written under {root}")
@@ -850,6 +935,8 @@ def run_experiment(
     simulate_death: bool = False,
     offline_log_root: Path | None = None,
     measurement_rng_seed: int | None = None,
+    estimate_robot_parameters: bool = False,
+    skip_nav: bool = False,
 ) -> None:
     _ = cycles  # reserved for multi-phase / repeat missions
 
@@ -888,6 +975,16 @@ def run_experiment(
 
     wheel_radius = r.WHEEL_RADIUS
     base_length = r.BASE_LENGTH
+    ekf_wheel_radius = (
+        float(FILTER_EKF_PRIOR_WHEEL_RADIUS_M)
+        if FILTER_EKF_PRIOR_WHEEL_RADIUS_M is not None
+        else float(wheel_radius)
+    )
+    ekf_base_length = (
+        float(FILTER_EKF_PRIOR_BASE_LENGTH_M)
+        if FILTER_EKF_PRIOR_BASE_LENGTH_M is not None
+        else float(base_length)
+    )
     dt = r.TIME_STEP
 
     counts_to_rad = 2 * np.pi / (r.ENCODER_COUNTS_PER_REVOLUTION * r.MOTOR_GEAR_RATIO)
@@ -901,10 +998,11 @@ def run_experiment(
         ekfs[i] = UnicycleEKF(
             initial_state=np.asarray(initial_conditions[:, i], dtype=float).reshape(-1),
             initial_covariance=np.zeros((3, 3)),
-            b=base_length,
-            r=wheel_radius,
+            b=ekf_base_length,
+            r=ekf_wheel_radius,
             M=encoder_noise_matrix,
             Q=process_noise_matrix,
+            estimate_robot_parameters=estimate_robot_parameters,
         )
 
     R_range_var = float(Map.LIGHTHOUSE_RANGE_MEAS_VAR_M2)
@@ -988,6 +1086,7 @@ def run_experiment(
 
     gt_history: list[list[np.ndarray]] = [[] for _ in range(n)]
     kf_history: list[list[np.ndarray]] = [[] for _ in range(n)]
+    kf_kinematics_history: list[list[np.ndarray]] = [[] for _ in range(n)]
     landmark_history: list[list[dict[str, list[float]]]] = [[] for _ in range(n)]
     encoders_prev = r.get_encoders()
 
@@ -1026,9 +1125,43 @@ def run_experiment(
     skip_next_pose_read = False
     scout_robot_dead = False
     death_overlay: list = [None]
+    # After map fusion: no scout EKF predict/update, no GT/KF/landmark/offline appends (scouts hold still in nav).
+    log_and_filter_scout_and_gt = True
+
+    def _save_kinematics_figures_after_fusion() -> None:
+        if not estimate_robot_parameters or not gt_history[MOTHERSHIP_INDEX + 1]:
+            return
+        T_plot = len(gt_history[MOTHERSHIP_INDEX + 1])
+        sim_plot = np.arange(T_plot, dtype=np.float64) * float(dt)
+        kin_plot = np.full((T_plot, n, 3), np.nan, dtype=np.float64)
+        for ri in range(n):
+            if ri == MOTHERSHIP_INDEX:
+                continue
+            arr = np.asarray(kf_kinematics_history[ri], dtype=np.float64).reshape(-1, 3)
+            if arr.shape[0] == T_plot:
+                kin_plot[:, ri, :] = arr
+        _save_scout_kinematics_figure(
+            sim_plot,
+            kin_plot,
+            n_robots=n,
+            mothership_index=MOTHERSHIP_INDEX,
+            wheel_radius_nominal_m=float(ekf_wheel_radius),
+            base_length_nominal_m=float(ekf_base_length),
+            out_path=_ROOT / "ekf_scout_kinematics_estimate.png",
+        )
+        if offline_root is not None:
+            _save_scout_kinematics_figure(
+                sim_plot,
+                kin_plot,
+                n_robots=n,
+                mothership_index=MOTHERSHIP_INDEX,
+                wheel_radius_nominal_m=float(ekf_wheel_radius),
+                base_length_nominal_m=float(ekf_base_length),
+                out_path=offline_root / "ekf_scout_kinematics.png",
+            )
 
     def tracking_step() -> None:
-        nonlocal x, encoders_prev, s_along_floor, nav_phase, skip_next_pose_read, scout_robot_dead
+        nonlocal x, encoders_prev, s_along_floor, nav_phase, skip_next_pose_read, scout_robot_dead, log_and_filter_scout_and_gt
         offline_step = len(offline_pose) if offline_root is not None else -1
         if skip_next_pose_read:
             skip_next_pose_read = False
@@ -1113,153 +1246,152 @@ def run_experiment(
         v_enc_all = (wheel_radius / 2.0) * (dphi_R + dphi_L) / dt
         w_enc_all = (wheel_radius / base_length) * (dphi_R - dphi_L) / dt
 
-        for i in range(MOTHERSHIP_INDEX + 1, n):
-            if simulate_death and scout_robot_dead and i == SIMULATE_DEATH_SCOUT_INDEX:
-                continue
-            ekfs[i].predict(float(v_enc_all[i]), float(w_enc_all[i]), dt)
+        if log_and_filter_scout_and_gt:
+            for i in range(MOTHERSHIP_INDEX + 1, n):
+                if simulate_death and scout_robot_dead and i == SIMULATE_DEATH_SCOUT_INDEX:
+                    continue
+                ekfs[i].predict(float(dphi_R[i]), float(dphi_L[i]), dt)
         encoders_prev = encoders_curr.copy()
 
-        for i in range(MOTHERSHIP_INDEX + 1, n):
-            robot_xy = x[:2, i]
-            theta_gt = float(x[2, i])
-            if nav_phase:
-                continue
-            if simulate_death and scout_robot_dead and i == SIMULATE_DEATH_SCOUT_INDEX:
-                continue
-            for lh_name, lh_xy in lighthouses.items():
-                d = float(np.linalg.norm(robot_xy - lh_xy))
-                last_t = lighthouse_last_update[i][lh_name]
-                d_min = float(Map.LIGHTHOUSE_MEASUREMENT_MIN_RANGE_M)
-                d_range_reliable = float(Map.LIGHTHOUSE_BEARING_AND_RANGE_MAX_M)
-                d_bearing_max = float(Map.LIGHTHOUSE_BEARING_SIGHTING_MAX_M)
-                in_sighting = d_min < d < d_bearing_max
-                use_range = d < d_range_reliable
-                if (
-                    in_sighting
-                    and time.time() - last_t > lighthouse_update_interval_s
-                ):
-                    lighthouse_last_update[i][lh_name] = time.time()
-                    z_b, z_r = _simulate_lighthouse_measurements(
-                        robot_xy,
-                        theta_gt,
-                        lh_xy,
-                        rng_meas,
-                        R_bearing_var,
-                        R_range_var,
-                        include_bearing=True,
-                        include_range=use_range,
-                    )
-                    ekfs[i].process_beacon_update(
-                        lh_xy,
-                        z_b,
-                        R_bearing_var,
-                        z_r,
-                        R_range_var if use_range else None,
-                    )
-                    if offline_root is not None:
-                        zb_f = float(z_b) if z_b is not None else float("nan")
-                        zr_f = float(z_r) if z_r is not None else float("nan")
-                        offline_lh_meas.append(
-                            (
-                                offline_step,
-                                float(time.time()),
-                                int(i),
-                                str(lh_name),
-                                zb_f,
-                                zr_f,
-                                np.uint8(1 if use_range else 0),
-                                float(lh_xy[0]),
-                                float(lh_xy[1]),
-                            )
+        if log_and_filter_scout_and_gt:
+            for i in range(MOTHERSHIP_INDEX + 1, n):
+                robot_xy = x[:2, i]
+                theta_gt = float(x[2, i])
+                if nav_phase:
+                    continue
+                if simulate_death and scout_robot_dead and i == SIMULATE_DEATH_SCOUT_INDEX:
+                    continue
+                for lh_name, lh_xy in lighthouses.items():
+                    d = float(np.linalg.norm(robot_xy - lh_xy))
+                    last_t = lighthouse_last_update[i][lh_name]
+                    d_min = float(Map.LIGHTHOUSE_MEASUREMENT_MIN_RANGE_M)
+                    d_range_reliable = float(Map.LIGHTHOUSE_BEARING_AND_RANGE_MAX_M)
+                    d_bearing_max = float(Map.LIGHTHOUSE_BEARING_SIGHTING_MAX_M)
+                    in_sighting = d_min < d < d_bearing_max
+                    use_range = d < d_range_reliable
+                    if (
+                        in_sighting
+                        and time.time() - last_t > lighthouse_update_interval_s
+                    ):
+                        lighthouse_last_update[i][lh_name] = time.time()
+                        z_b, z_r = _simulate_lighthouse_measurements(
+                            robot_xy,
+                            theta_gt,
+                            lh_xy,
+                            rng_meas,
+                            R_bearing_var,
+                            R_range_var,
+                            include_bearing=True,
+                            include_range=use_range,
                         )
-
-            # Unknown landmarks: one EKF track per buoy / per enemy (unique ``landmark_type`` string).
-            # Using a single label for all buoys (or gating association on ``‖m_landmark - p_robot‖``)
-            # spawns duplicate tracks and mis-associations; landmark–robot coupling in ``P`` then drags
-            # the pose estimate. Landmarks correctly have zero process noise; the bug was data association.
-            for bname, bxy in env_map.buoys.items():
-                bxy = np.asarray(bxy, dtype=np.float64).reshape(2)
-                d_lm = float(np.linalg.norm(robot_xy - bxy))
-                lk = f"buoy:{bname}"
-                last_lm = landmark_last_update[i][lk]
-                if (
-                    lm_d_min_m < d_lm < lm_d_max_m
-                    and time.time() - last_lm > lighthouse_update_interval_s
-                ):
-                    landmark_last_update[i][lk] = time.time()
-                    zb_lm, zr_lm = _simulate_lighthouse_measurements(
-                        robot_xy,
-                        theta_gt,
-                        bxy,
-                        rng_meas,
-                        R_bearing_var,
-                        R_range_var,
-                        include_bearing=True,
-                        include_range=True,
-                    )
-                    ekfs[i].process_landmark_update(
-                        f"{_LM_PREFIX_BUOY}{bname}",
-                        float(zb_lm),
-                        R_bearing_var,
-                        float(zr_lm),
-                        R_range_var,
-                    )
-                    if offline_root is not None:
-                        offline_buoy_meas.append(
-                            (
-                                offline_step,
-                                float(time.time()),
-                                int(i),
-                                str(bname),
-                                float(zb_lm),
-                                float(zr_lm),
-                                float(bxy[0]),
-                                float(bxy[1]),
-                            )
+                        ekfs[i].process_beacon_update(
+                            lh_xy,
+                            z_b,
+                            R_bearing_var,
+                            z_r,
+                            R_range_var if use_range else None,
                         )
-
-            for ei, exy in enumerate(enemy_positions):
-                d_lm = float(np.linalg.norm(robot_xy - exy))
-                lk = f"enemy:{ei}"
-                last_lm = landmark_last_update[i][lk]
-                if (
-                    lm_d_min_m < d_lm < lm_d_max_m
-                    and time.time() - last_lm > lighthouse_update_interval_s
-                ):
-                    landmark_last_update[i][lk] = time.time()
-                    zb_lm, zr_lm = _simulate_lighthouse_measurements(
-                        robot_xy,
-                        theta_gt,
-                        exy,
-                        rng_meas,
-                        R_bearing_var,
-                        R_range_var,
-                        include_bearing=True,
-                        include_range=True,
-                    )
-                    ekfs[i].process_landmark_update(
-                        f"{_LM_PREFIX_ENEMY_SHIP}{ei}",
-                        float(zb_lm),
-                        R_bearing_var,
-                        float(zr_lm),
-                        R_range_var,
-                    )
-                    if offline_root is not None:
-                        exy_arr = np.asarray(exy, dtype=np.float64).reshape(2)
-                        offline_enemy_meas.append(
-                            (
-                                offline_step,
-                                float(time.time()),
-                                int(i),
-                                int(ei),
-                                float(zb_lm),
-                                float(zr_lm),
-                                float(exy_arr[0]),
-                                float(exy_arr[1]),
+                        if offline_root is not None:
+                            zb_f = float(z_b) if z_b is not None else float("nan")
+                            zr_f = float(z_r) if z_r is not None else float("nan")
+                            offline_lh_meas.append(
+                                (
+                                    offline_step,
+                                    float(time.time()),
+                                    int(i),
+                                    str(lh_name),
+                                    zb_f,
+                                    zr_f,
+                                    np.uint8(1 if use_range else 0),
+                                    float(lh_xy[0]),
+                                    float(lh_xy[1]),
+                                )
                             )
-                        )
 
-        if offline_root is not None:
+                # Unknown landmarks: one EKF track per buoy / per enemy (unique ``landmark_type`` string).
+                for bname, bxy in env_map.buoys.items():
+                    bxy = np.asarray(bxy, dtype=np.float64).reshape(2)
+                    d_lm = float(np.linalg.norm(robot_xy - bxy))
+                    lk = f"buoy:{bname}"
+                    last_lm = landmark_last_update[i][lk]
+                    if (
+                        lm_d_min_m < d_lm < lm_d_max_m
+                        and time.time() - last_lm > lighthouse_update_interval_s
+                    ):
+                        landmark_last_update[i][lk] = time.time()
+                        zb_lm, zr_lm = _simulate_lighthouse_measurements(
+                            robot_xy,
+                            theta_gt,
+                            bxy,
+                            rng_meas,
+                            R_bearing_var,
+                            R_range_var,
+                            include_bearing=True,
+                            include_range=True,
+                        )
+                        ekfs[i].process_landmark_update(
+                            f"{_LM_PREFIX_BUOY}{bname}",
+                            float(zb_lm),
+                            R_bearing_var,
+                            float(zr_lm),
+                            R_range_var,
+                        )
+                        if offline_root is not None:
+                            offline_buoy_meas.append(
+                                (
+                                    offline_step,
+                                    float(time.time()),
+                                    int(i),
+                                    str(bname),
+                                    float(zb_lm),
+                                    float(zr_lm),
+                                    float(bxy[0]),
+                                    float(bxy[1]),
+                                )
+                            )
+
+                for ei, exy in enumerate(enemy_positions):
+                    d_lm = float(np.linalg.norm(robot_xy - exy))
+                    lk = f"enemy:{ei}"
+                    last_lm = landmark_last_update[i][lk]
+                    if (
+                        lm_d_min_m < d_lm < lm_d_max_m
+                        and time.time() - last_lm > lighthouse_update_interval_s
+                    ):
+                        landmark_last_update[i][lk] = time.time()
+                        zb_lm, zr_lm = _simulate_lighthouse_measurements(
+                            robot_xy,
+                            theta_gt,
+                            exy,
+                            rng_meas,
+                            R_bearing_var,
+                            R_range_var,
+                            include_bearing=True,
+                            include_range=True,
+                        )
+                        ekfs[i].process_landmark_update(
+                            f"{_LM_PREFIX_ENEMY_SHIP}{ei}",
+                            float(zb_lm),
+                            R_bearing_var,
+                            float(zr_lm),
+                            R_range_var,
+                        )
+                        if offline_root is not None:
+                            exy_arr = np.asarray(exy, dtype=np.float64).reshape(2)
+                            offline_enemy_meas.append(
+                                (
+                                    offline_step,
+                                    float(time.time()),
+                                    int(i),
+                                    int(ei),
+                                    float(zb_lm),
+                                    float(zr_lm),
+                                    float(exy_arr[0]),
+                                    float(exy_arr[1]),
+                                )
+                            )
+
+        if offline_root is not None and log_and_filter_scout_and_gt:
             offline_pose.append(np.asarray(x, dtype=np.float64).copy())
             offline_enc.append(encoders_curr.astype(np.int32).copy())
             offline_ori.append(np.asarray(r.get_orientations(), dtype=np.float64).copy())
@@ -1267,28 +1399,35 @@ def run_experiment(
             offline_v.append(np.asarray(v_enc_all, dtype=np.float64).copy())
             offline_w.append(np.asarray(w_enc_all, dtype=np.float64).copy())
 
-        for i in range(n):
-            gt_history[i].append(
-                np.array(
-                    [float(x[0, i]), float(x[1, i]), float(x[2, i])],
-                    dtype=np.float64,
+        if log_and_filter_scout_and_gt:
+            for i in range(n):
+                gt_history[i].append(
+                    np.array(
+                        [float(x[0, i]), float(x[1, i]), float(x[2, i])],
+                        dtype=np.float64,
+                    )
                 )
-            )
-            if i == MOTHERSHIP_INDEX:
-                landmark_history[i].append({})
-                continue
-            st = np.asarray(ekfs[i].state, dtype=float).reshape(-1)
-            kf_history[i].append(
-                np.array([float(st[0]), float(st[1]), float(st[2])], dtype=np.float64)
-            )
-            snap: dict[str, list[float]] = {}
-            ekf_i = ekfs[i]
-            for lm_idx in sorted(ekf_i.landmarks.keys()):
-                lm_type = str(ekf_i.landmarks[lm_idx])
-                lx = float(st[3 + 2 * lm_idx])
-                ly = float(st[3 + 2 * lm_idx + 1])
-                snap[lm_type] = [lx, ly]
-            landmark_history[i].append(snap)
+                if i == MOTHERSHIP_INDEX:
+                    landmark_history[i].append({})
+                    continue
+                st = np.asarray(ekfs[i].state, dtype=float).reshape(-1)
+                kf_history[i].append(
+                    np.array([float(st[0]), float(st[1]), float(st[2])], dtype=np.float64)
+                )
+                if estimate_robot_parameters:
+                    kf_kinematics_history[i].append(
+                        np.asarray(st[3:6], dtype=np.float64).reshape(3).copy()
+                    )
+                snap: dict[str, list[float]] = {}
+                ekf_i = ekfs[i]
+                b0 = int(ekf_i.base_state_size)
+                for lm_idx in sorted(ekf_i.landmarks.keys()):
+                    lm_type = str(ekf_i.landmarks[lm_idx])
+                    j0 = b0 + 2 * int(lm_idx)
+                    lx = float(st[j0])
+                    ly = float(st[j0 + 1])
+                    snap[lm_type] = [lx, ly]
+                landmark_history[i].append(snap)
 
         for i in range(n):
             if not gt_history[i]:
@@ -1316,6 +1455,7 @@ def run_experiment(
             cov_ellipses[i].set_angle(eang)
 
             ekf_i = ekfs[i]
+            b0 = int(ekf_i.base_state_size)
             # One ellipse per landmark index (each index is a unique object id in ``landmarks``).
             lm_indices = sorted(ekf_i.landmarks.keys())
             le_list = landmark_ellipses[i]
@@ -1338,9 +1478,10 @@ def run_experiment(
                 old_e.remove()
             for j, lm_idx in enumerate(lm_indices):
                 lm_type = str(ekf_i.landmarks[lm_idx])
-                lx = float(st[3 + 2 * lm_idx])
-                ly = float(st[3 + 2 * lm_idx + 1])
-                sl = slice(3 + 2 * lm_idx, 3 + 2 * lm_idx + 2)
+                j0 = b0 + 2 * int(lm_idx)
+                lx = float(st[j0])
+                ly = float(st[j0 + 1])
+                sl = slice(j0, j0 + 2)
                 P_lm = P_full[sl, sl]
                 ew_lm, eh_lm, eang_lm = _xy_cov_ellipse_width_height_angle_deg(P_lm, cov_n_sigma)
                 e_lm = le_list[j]
@@ -1375,6 +1516,9 @@ def run_experiment(
 
     fusion_report = _build_map_fusion_landmark_report(ekfs, env_map, enemy_positions)
     _apply_map_fusion_to_ekf_landmarks(ekfs, fusion_report)
+    # Kinematics plot uses estimates through map fusion only; logging/EKF for scouts stops before nav.
+    _save_kinematics_figures_after_fusion()
+    log_and_filter_scout_and_gt = False
 
     # Banner already removed by ``_flash_center_title``; hold the scouting map briefly, then redraw fused.
     if r.show_figure:
@@ -1406,35 +1550,39 @@ def run_experiment(
         r._fig.canvas.flush_events()
         plt.pause(3.0)
 
-    _flash_center_title(r, "Nav Phase")
-    x = r.get_poses()
-    starts_xy = np.asarray(x[:2, :], dtype=np.float64).reshape(2, n)
-    # Scouts must track ``scout_goal_xy`` (same target as ``nav_goal_xy``), not an empty waypoint
-    # list (which ``Router`` treats as “hold at nav start only”). Otherwise barrier motion can push
-    # them >``create_at_position``'s default 5 cm from ``scout_goal_xy`` while they are never
-    # commanded back — ``while not at_position(x, nav_goal_xy)`` never becomes true.
-    nav_waypoints: list[np.ndarray] = []
-    for i in range(n):
-        if i == MOTHERSHIP_INDEX:
-            nav_waypoints.append(MOTHERSHIP_NAV_GOAL_XY.reshape(1, 2))
-        else:
-            nav_waypoints.append(scout_goal_xy[:, i].reshape(1, 2))
-    routes[:] = router.routes_through_waypoints(starts_xy, nav_waypoints)
-    route_vertex_cumlen[:] = _route_vertex_cumlen_list(routes)
-    s_along_floor[:] = 0.0
-    nav_phase = True
-    skip_next_pose_read = True
+    if not skip_nav:
+        _flash_center_title(r, "Nav Phase")
+        x = r.get_poses()
+        starts_xy = np.asarray(x[:2, :], dtype=np.float64).reshape(2, n)
+        # Scouts must track ``scout_goal_xy`` (same target as ``nav_goal_xy``), not an empty waypoint
+        # list (which ``Router`` treats as “hold at nav start only”). Otherwise barrier motion can push
+        # them >``create_at_position``'s default 5 cm from ``scout_goal_xy`` while they are never
+        # commanded back — ``while not at_position(x, nav_goal_xy)`` never becomes true.
+        nav_waypoints: list[np.ndarray] = []
+        for i in range(n):
+            if i == MOTHERSHIP_INDEX:
+                nav_waypoints.append(MOTHERSHIP_NAV_GOAL_XY.reshape(1, 2))
+            else:
+                nav_waypoints.append(scout_goal_xy[:, i].reshape(1, 2))
+        routes[:] = router.routes_through_waypoints(starts_xy, nav_waypoints)
+        route_vertex_cumlen[:] = _route_vertex_cumlen_list(routes)
+        s_along_floor[:] = 0.0
+        nav_phase = True
+        skip_next_pose_read = True
 
-    nav_goal_xy = np.zeros((2, n), dtype=np.float64)
-    nav_goal_xy[:, MOTHERSHIP_INDEX] = MOTHERSHIP_NAV_GOAL_XY
-    for i in range(MOTHERSHIP_INDEX + 1, n):
-        nav_goal_xy[:, i] = scout_goal_xy[:, i]
+        nav_goal_xy = np.zeros((2, n), dtype=np.float64)
+        nav_goal_xy[:, MOTHERSHIP_INDEX] = MOTHERSHIP_NAV_GOAL_XY
+        for i in range(MOTHERSHIP_INDEX + 1, n):
+            nav_goal_xy[:, i] = scout_goal_xy[:, i]
 
-    while not at_position(x, nav_goal_xy)[0]:
-        tracking_step()
+        while not at_position(x, nav_goal_xy)[0]:
+            tracking_step()
 
-    nav_phase = False
-    skip_next_pose_read = False
+        nav_phase = False
+        skip_next_pose_read = False
+    else:
+        nav_phase = False
+        skip_next_pose_read = False
 
     rmse_report = _build_rmse_report(
         gt_history, kf_history, landmark_history, env_map, enemy_positions
@@ -1480,6 +1628,11 @@ def run_experiment(
             landmark_history=landmark_history,
             routes=routes,
             fusion_report=fusion_report,
+            estimate_robot_parameters=estimate_robot_parameters,
+            kf_kinematics_history=kf_kinematics_history if estimate_robot_parameters else None,
+            skip_nav=skip_nav,
+            ekf_prior_wheel_radius_m=float(ekf_wheel_radius),
+            ekf_prior_base_length_m=float(ekf_base_length),
         )
 
     r.debug()
@@ -1532,6 +1685,25 @@ def parse_args():
         default=None,
         help="Seed for simulated lighthouse / landmark measurements (also used when --save-offline draws RNG).",
     )
+    p.add_argument(
+        "--estimate-robot-parameters",
+        "--estimate_robot_parameters",
+        "--est-params",
+        dest="estimate_robot_parameters",
+        action="store_true",
+        help=(
+            "Augment each scout EKF with wheel radii and base length in the state and estimate them "
+            "(default: off; use nominal Robotarium kinematics only)."
+        ),
+    )
+    p.add_argument(
+        "--skip-nav",
+        action="store_true",
+        help=(
+            "Skip the mothership nav phase (no extra ``tracking_step`` after map fusion). Scout EKF, "
+            "GT/KF/landmark logging, and offline bundles end right after map fusion for faster iteration."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1545,6 +1717,8 @@ def main():
         simulate_death=bool(args.simulate_death),
         offline_log_root=args.save_offline,
         measurement_rng_seed=args.measurement_seed,
+        estimate_robot_parameters=bool(args.estimate_robot_parameters),
+        skip_nav=bool(args.skip_nav),
     )
 
 
