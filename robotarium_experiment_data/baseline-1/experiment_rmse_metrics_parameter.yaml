@@ -1,0 +1,195 @@
+{
+  "note": "RMSE (root mean square error). YAML file uses JSON syntax (valid YAML 1.2). Robot 0 (mothership) is excluded \u2014 assumed perfect GNSS.",
+  "mothership_index_excluded_from_filter_and_rmse": 0,
+  "ships": {
+    "per_robot": [
+      {
+        "robot_index": 1,
+        "pose_vs_ground_truth": {
+          "rmse_x_m": 0.1483540251936693,
+          "rmse_y_m": 0.2009320945820748,
+          "rmse_position_m": 0.24976513652690546,
+          "rmse_theta_rad": 0.5005692876480777,
+          "rmse_theta_deg": 28.680507536104944,
+          "n_timesteps": 815
+        },
+        "landmarks_vs_ground_truth": {
+          "enemy ship:5": {
+            "n_samples": 815,
+            "rmse_x_m": 0.056326638253617146,
+            "rmse_y_m": 0.052006188359406895,
+            "rmse_position_m": 0.07666377113492368
+          },
+          "enemy ship:0": {
+            "n_samples": 756,
+            "rmse_x_m": 0.3232828441830307,
+            "rmse_y_m": 0.21908555234066068,
+            "rmse_position_m": 0.39052564139564777
+          },
+          "enemy ship:6": {
+            "n_samples": 510,
+            "rmse_x_m": 0.05963986927842386,
+            "rmse_y_m": 0.12788989789993793,
+            "rmse_position_m": 0.14111250827762942
+          },
+          "enemy ship:2": {
+            "n_samples": 488,
+            "rmse_x_m": 0.04931331693478536,
+            "rmse_y_m": 0.09113484893112912,
+            "rmse_position_m": 0.10362125224494402
+          },
+          "enemy ship:3": {
+            "n_samples": 353,
+            "rmse_x_m": 0.09148877791664406,
+            "rmse_y_m": 0.2439222863153604,
+            "rmse_position_m": 0.2605154088456068
+          },
+          "enemy ship:8": {
+            "n_samples": 299,
+            "rmse_x_m": 0.04311944455524523,
+            "rmse_y_m": 0.317146019160509,
+            "rmse_position_m": 0.32006387482518356
+          }
+        }
+      },
+      {
+        "robot_index": 2,
+        "pose_vs_ground_truth": {
+          "rmse_x_m": 0.01962359306288214,
+          "rmse_y_m": 0.03787169418932948,
+          "rmse_position_m": 0.042653846549492905,
+          "rmse_theta_rad": 0.10136095778374729,
+          "rmse_theta_deg": 5.80755508841243,
+          "n_timesteps": 815
+        },
+        "landmarks_vs_ground_truth": {
+          "enemy ship:5": {
+            "n_samples": 815,
+            "rmse_x_m": 0.0316765900827617,
+            "rmse_y_m": 0.007563826792047941,
+            "rmse_position_m": 0.03256712813576627
+          },
+          "enemy ship:2": {
+            "n_samples": 740,
+            "rmse_x_m": 0.009562387997072165,
+            "rmse_y_m": 0.008021650908343305,
+            "rmse_position_m": 0.012481432109412556
+          },
+          "enemy ship:6": {
+            "n_samples": 727,
+            "rmse_x_m": 0.009186737868863294,
+            "rmse_y_m": 0.007535870582736805,
+            "rmse_position_m": 0.011882150399273898
+          },
+          "enemy ship:4": {
+            "n_samples": 712,
+            "rmse_x_m": 0.012510161334282451,
+            "rmse_y_m": 0.010286821424839398,
+            "rmse_position_m": 0.016196383288756493
+          },
+          "enemy ship:1": {
+            "n_samples": 709,
+            "rmse_x_m": 0.013357841605713676,
+            "rmse_y_m": 0.006728390231635649,
+            "rmse_position_m": 0.014956709780981422
+          },
+          "enemy ship:3": {
+            "n_samples": 516,
+            "rmse_x_m": 0.011985304625398638,
+            "rmse_y_m": 0.024978995484472126,
+            "rmse_position_m": 0.02770555435967454
+          },
+          "enemy ship:8": {
+            "n_samples": 453,
+            "rmse_x_m": 0.006939218825319153,
+            "rmse_y_m": 0.014811381073029442,
+            "rmse_position_m": 0.01635633721822091
+          },
+          "enemy ship:7": {
+            "n_samples": 439,
+            "rmse_x_m": 0.015937978872617116,
+            "rmse_y_m": 0.021113497844574277,
+            "rmse_position_m": 0.026453713572518175
+          }
+        }
+      },
+      {
+        "robot_index": 3,
+        "pose_vs_ground_truth": {
+          "rmse_x_m": 0.02810902237350881,
+          "rmse_y_m": 0.02788472446616419,
+          "rmse_position_m": 0.03959387575558011,
+          "rmse_theta_rad": 0.13285478469568024,
+          "rmse_theta_deg": 7.612018451181719,
+          "n_timesteps": 815
+        },
+        "landmarks_vs_ground_truth": {
+          "enemy ship:5": {
+            "n_samples": 815,
+            "rmse_x_m": 0.03884421409857163,
+            "rmse_y_m": 0.022061080363626723,
+            "rmse_position_m": 0.044671738669387694
+          },
+          "enemy ship:1": {
+            "n_samples": 708,
+            "rmse_x_m": 0.018066140231139234,
+            "rmse_y_m": 0.01748726219327324,
+            "rmse_position_m": 0.025143384057590007
+          },
+          "enemy ship:4": {
+            "n_samples": 660,
+            "rmse_x_m": 0.019077607405733086,
+            "rmse_y_m": 0.011641289112065675,
+            "rmse_position_m": 0.022348930992733874
+          },
+          "enemy ship:2": {
+            "n_samples": 656,
+            "rmse_x_m": 0.014635681659414666,
+            "rmse_y_m": 0.013458176604593447,
+            "rmse_position_m": 0.01988279897690849
+          },
+          "enemy ship:6": {
+            "n_samples": 570,
+            "rmse_x_m": 0.009497471235992842,
+            "rmse_y_m": 0.009813759462879726,
+            "rmse_position_m": 0.013656933575066284
+          },
+          "enemy ship:7": {
+            "n_samples": 481,
+            "rmse_x_m": 0.015186806344331609,
+            "rmse_y_m": 0.02073753266413369,
+            "rmse_position_m": 0.02570378081015014
+          },
+          "enemy ship:8": {
+            "n_samples": 408,
+            "rmse_x_m": 0.03227418634354146,
+            "rmse_y_m": 0.012196440951113925,
+            "rmse_position_m": 0.03450183003858849
+          },
+          "enemy ship:3": {
+            "n_samples": 370,
+            "rmse_x_m": 0.009785136252158433,
+            "rmse_y_m": 0.010134928014466181,
+            "rmse_position_m": 0.014087783975193424
+          }
+        }
+      }
+    ],
+    "total_filtered_robots_all_timesteps": {
+      "rmse_x_m": 0.08790927014950486,
+      "rmse_y_m": 0.1191435124999313,
+      "rmse_position_m": 0.14806490586577195,
+      "rmse_theta_rad": 0.30468237522370634,
+      "rmse_theta_deg": 17.457014192339695,
+      "n_timesteps": 2445
+    }
+  },
+  "landmarks": {
+    "total_pooled_filtered_robots": {
+      "n_samples": 13000,
+      "rmse_x_m": 0.08410821849029342,
+      "rmse_y_m": 0.08944457280164911,
+      "rmse_position_m": 0.12277835322759645
+    }
+  }
+}
