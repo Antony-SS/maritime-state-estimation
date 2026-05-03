@@ -75,7 +75,7 @@ class Map:
         (0.9, 0.25),
         (0.9, -0.55),
     ]
-    ENEMY_RADIUS_M: float = 0.02
+    ENEMY_RADIUS_M: float = 0.03
     ENEMY_COLOR = "#ff4545"  # bright red (projector / small markers)
 
     # Enemy hazard stamp: ``σ_r = NAV_ENEMY_INFLATION_RADIUS_MULT × (COLLISION_DIAMETER / 2)`` in
